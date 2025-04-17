@@ -39,7 +39,7 @@ class YOLOv8ObjectDetector {
     /// The actual class names from the model (e.g., COCO labels).
     var classNames: [String] = cocoClasses
     /// Confidence threshold for filtering detections.
-    var confidenceThreshold: Float = 0.25
+    var confidenceThreshold: Float = 0.5
     
     // Colors for visualization
     lazy var colors: [UIColor] = {
@@ -63,7 +63,7 @@ class YOLOv8ObjectDetector {
     
     private func setupModel() {
         // Look for both ONNX and CoreML models
-        if let modelPath = Bundle.main.path(forResource: "yolov8n", ofType: "mlmodelc") {
+        if let modelPath = Bundle.main.path(forResource: "train14_best", ofType: "mlmodelc") {
             do {
                 // If converted model exists
                 let modelURL = URL(fileURLWithPath: modelPath)
@@ -154,18 +154,32 @@ class YOLOv8ObjectDetector {
             print("Processing \(results.count) VNRecognizedObjectObservation results")
             
             for result in results {
-                // Filter by confidence
-                guard result.confidence >= confidenceThreshold else { continue }
+                print("Raw confidence: \(result.confidence)")
                 
                 // Get the best label
                 guard let topLabel = result.labels.first else { continue }
+                
+                // Apply different confidence thresholds based on class
+                let requiredConfidence: Float
+                let labelName = topLabel.identifier.lowercased()
+                
+                if labelName == "golf ball" || labelName == "sports ball" {
+                    requiredConfidence = 0.7 // 70% for golf balls
+                } else if labelName == "golf hole" {
+                    requiredConfidence = 0.5 // 50% for holes
+                } else {
+                    requiredConfidence = confidenceThreshold // Default for other objects
+                }
+                
+                // Filter by appropriate confidence threshold
+                guard result.confidence >= requiredConfidence else { continue }
                 
                 // Transform coordinates to image space
                 let boundingBox = transformBoundingBox(result.boundingBox, imageSize: imageSize)
                 
                 let detection = DetectionBox(
                     className: topLabel.identifier,
-                    confidence: topLabel.confidence,
+                    confidence: result.confidence,
                     boundingBox: boundingBox
                 )
                 
@@ -176,18 +190,35 @@ class YOLOv8ObjectDetector {
             print("Processing \(results.count) VNDetectedObjectObservation results")
             
             for result in results {
-                // Filter by confidence
-                guard result.confidence >= confidenceThreshold else { continue }
+                print("Raw confidence: \(result.confidence)")
+                
+                // For VNDetectedObjectObservation, we don't have labels
+                // We'll need to use another method to identify the object class
+                // For example, we can use the custom properties if available
+                
+                // Apply different confidence thresholds based on object type
+                // We'll need to identify object type by some other means
+                // For now, using a default confidence threshold
+                let requiredConfidence = confidenceThreshold
+                
+                // Filter by appropriate confidence threshold
+                guard result.confidence >= requiredConfidence else { continue }
                 
                 // Transform coordinates to image space
                 let boundingBox = transformBoundingBox(result.boundingBox, imageSize: imageSize)
                 
-                // For this type, we need to guess the class from the properties
-                // This is a simplification and may need adjustment based on your model
-                let classIndex = min(Int(boundingBox.origin.x * 10) % cocoClasses.count, cocoClasses.count - 1)
+                // For this type, we need to determine the class another way
+                // This is placeholder logic - you'll need to adapt this based on your model's output
+                // Using top 2 classes as example - golf ball and golf hole
+                let classIndex = min(Int(boundingBox.origin.x * 10) % 2, 1)
+                let className = classIndex == 0 ? "golf ball" : "golf hole"
+                
+                // Adjust confidence threshold after classification
+                if className == "golf ball" && result.confidence < 0.7 { continue }
+                if className == "golf hole" && result.confidence < 0.5 { continue }
                 
                 let detection = DetectionBox(
-                    className: cocoClasses[classIndex],
+                    className: className,
                     confidence: result.confidence,
                     boundingBox: boundingBox
                 )

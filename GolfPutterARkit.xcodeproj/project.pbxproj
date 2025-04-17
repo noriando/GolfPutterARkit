@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		CCE697D12DAA3CCD00B59528 /* train14_best.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = CCE697D02DAA3CCD00B59528 /* train14_best.mlpackage */; };
 		CCEFC94C2D9A8DD100839A1C /* ARKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CCEFC94B2D9A8DD100839A1C /* ARKit.framework */; };
 /* End PBXBuildFile section */
 
@@ -31,6 +32,7 @@
 		CC60DCF82D97C9D100A8A458 /* GolfPutterARkit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GolfPutterARkit.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CC60DD0D2D97C9D200A8A458 /* GolfPutterARkitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GolfPutterARkitTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CC60DD172D97C9D200A8A458 /* GolfPutterARkitUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GolfPutterARkitUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		CCE697D02DAA3CCD00B59528 /* train14_best.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = train14_best.mlpackage; sourceTree = "<group>"; };
 		CCEFC94B2D9A8DD100839A1C /* ARKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ARKit.framework; path = System/Library/Frameworks/ARKit.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
@@ -86,6 +88,7 @@
 				CC60DD1A2D97C9D200A8A458 /* GolfPutterARkitUITests */,
 				CCEFC94A2D9A8DD100839A1C /* Frameworks */,
 				CC60DCF92D97C9D100A8A458 /* Products */,
+				CCE697D02DAA3CCD00B59528 /* train14_best.mlpackage */,
 			);
 			sourceTree = "<group>";
 		};
@@ -251,6 +254,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CCE697D12DAA3CCD00B59528 /* train14_best.mlpackage in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
