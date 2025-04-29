@@ -1,1716 +1,1105 @@
 import UIKit
-import ARKit
 import RealityKit
-import AVFoundation
+import ARKit
 
-class ViewController: UIViewController {
-    // AR view
+/// Main AR putting simulator view controller (manual two‑tap mode)
+class ViewController: UIViewController, ARSessionDelegate {
+    // MARK: - AR and UI
     private var arView: ARView!
+    private var infoTextView: UITextView!
+    private var resetButton: UIButton!
+    private var setBallButton: UIButton!
+    private var setHoleButton: UIButton!
     
-    // AR session configuration
-    private let configuration = ARWorldTrackingConfiguration()
-    
-    // UI elements
-    private var infoLabel: UILabel!
-    private var controlPanel: UIStackView!
-    //Yolo
-    private var yoloDetector: YOLOv8ObjectDetector?
-
-    private var isDetectionModeActive = false
-    private var currentDetections: [DetectionBox] = []
-    private var lastProcessedTime: TimeInterval = 0
-    private let processingInterval: TimeInterval = 0.5 // Process frames every 0.5 seconds
-    
-    private var ballIndicator: ModelEntity?
-    private var ballAnchor: AnchorEntity?
-    
-    private var confirmButton: UIButton?
-    
-    // Add these flags to track if positions are locked
-    private var isBallPositionLocked = false
-    private var isHolePositionLocked = false
-    
-    // 1. Add this single property to ViewController.swift
-    private var greenImage: UIImage? // Store the green surface image
-
-
-    
-    // Extend TapMode enum
-    enum TapMode {
-        case scanning, setBallPosition, setHolePosition, viewing, autoDetection
+    // MARK: - Mode Tracking
+    private enum PlacementMode {
+        case ball, hole, none
     }
-    
-    private var currentMode: TapMode = .scanning
-    
-    // 3D objects
-    private var ballEntity: ModelEntity?
-    private var holeEntity: ModelEntity?
-    private var pathEntity: ModelEntity?
-    
-    // Positions
+    private var currentMode = PlacementMode.none
+
+    // MARK: - Input & Positions
+    private var input: ARInputProvider!
     private var ballPosition: SIMD3<Float>?
     private var holePosition: SIMD3<Float>?
+    private var ballAnchor: AnchorEntity?
+    private var holeAnchor: AnchorEntity?
+    private var pathAnchors: [AnchorEntity] = []
+
+    // MARK: - Simulation Components
+    private let simulator = BallSimulator()
+    private let pathFinder = PathFinder()
+    private var multiShotPlanner: MultiShotPlanner!
+    private let renderer = LineRenderer()
     
-    // Add to ViewController.swift class properties
-    private var speechSynthesizer = AVSpeechSynthesizer()
+    // Add these properties to your ViewController class
+    private var terrainVisualizationAnchor: AnchorEntity?
+    private var showingTerrain: Bool = false
+    private var terrainButton: UIButton!
     
+    // Add this property for terrain sampling
+    private var terrainSampleBuffer: [SIMD3<Float>: [Float]] = [:]
+    
+    private var isCollectingTerrainData = false
+    private var terrainSamplingTimer: Timer?
+    private var collectionProgress: Float = 0
+
+
+
+    // MARK: - Lifecycle
     override func viewDidLoad() {
         super.viewDidLoad()
-        
         setupARView()
         setupUI()
-        // Initialize YOLO detector
-        yoloDetector = YOLOv8ObjectDetector()
-        yoloDetector?.confidenceThreshold = 0.5 // Adjust based on your needs
+        setupTerrainButton() // Add this line
+        
+        // Initialize input provider
+        input = DefaultARInputProvider(arView: arView)
+        // Initialize multiShotPlanner AFTER renderer is available
+        multiShotPlanner = MultiShotPlanner(lineRenderer: renderer)
+
+        
+        // Add tap gesture recognizer
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        arView.addGestureRecognizer(tap)
     }
-    
+
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        
-        // Start AR session
-        startARSession()
-    }
-    
-    override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        
-        // Pause AR session to save battery
-        arView.session.pause()
-        
-        // Clear all anchors and entities
-        arView.scene.anchors.removeAll()
-        
-        // Explicitly set all entities to nil
-        ballEntity = nil
-        holeEntity = nil
-        pathEntity = nil
-        
-        // Clear positions
-        ballPosition = nil
-        holePosition = nil
-    }
-    
-    // MARK: - Setup Methods
-    
-    private func setupARView() {
-        // Create AR view
-        arView = ARView(frame: view.bounds)
-        arView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        view.addSubview(arView)
-        
-        // Set up AR view options
-        arView.debugOptions = []
-        
-        // Add tap gesture for interaction
-        let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap))
-        arView.addGestureRecognizer(tapGesture)
-        
-    }
-    
-    
-    //
-    // Much simpler button layout - keep your original but just modify the button creation
-    // This preserves your existing layout structure
-    //
-    private func setupUI() {
-        // Add info label at the top
-        infoLabel = UILabel()
-        infoLabel.text = "グリーンをスキャン中..."
-        infoLabel.textAlignment = .center
-        infoLabel.backgroundColor = UIColor.black.withAlphaComponent(0.7)
-        infoLabel.textColor = .white
-        infoLabel.layer.cornerRadius = 10
-        infoLabel.layer.masksToBounds = true
-        infoLabel.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(infoLabel)
-        
-        // Position the label
-        NSLayoutConstraint.activate([
-            infoLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 20),
-            infoLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            infoLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, constant: -40),
-            infoLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 40)
-        ])
-        
-        // Add basic control panel at the bottom
-        controlPanel = UIStackView()
-        controlPanel.axis = .horizontal
-        controlPanel.spacing = 20
-        controlPanel.alignment = .center
-        controlPanel.distribution = .fillEqually
-        controlPanel.backgroundColor = UIColor.white.withAlphaComponent(0.8)
-        controlPanel.layer.cornerRadius = 20
-        controlPanel.layoutMargins = UIEdgeInsets(top: 10, left: 20, bottom: 10, right: 20)
-        controlPanel.isLayoutMarginsRelativeArrangement = true
-        controlPanel.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(controlPanel)
-        
-        // Position the control panel
-        NSLayoutConstraint.activate([
-            controlPanel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
-            controlPanel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            controlPanel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, constant: -40)
-        ])
-        
-        // Add buttons to control panel - just adding auto-detect to your original layout
-        let ballButton = createButton(title: "ボール", action: #selector(ballButtonTapped))
-        let holeButton = createButton(title: "ホール", action: #selector(holeButtonTapped))
-        let autoDetectButton = createButton(title: "自動検出", action: #selector(autoDetectButtonTapped))
-        let adviceButton = createButton(title: "アドバイス", action: #selector(getAdviceButtonTapped))
-        let resetButton = createButton(title: "リセット", action: #selector(resetButtonTapped))
-        
-        controlPanel.addArrangedSubview(ballButton)
-        controlPanel.addArrangedSubview(holeButton)
-        controlPanel.addArrangedSubview(autoDetectButton)
-        controlPanel.addArrangedSubview(adviceButton)
-        controlPanel.addArrangedSubview(resetButton)
-    }
-
-    private func createButton(title: String, action: Selector) -> UIButton {
-        let button = UIButton(type: .system)
-        button.setTitle(title, for: .normal)
-        button.setTitleColor(.blue, for: .normal)
-        button.backgroundColor = .white
-        button.layer.cornerRadius = 10
-        button.layer.borderWidth = 1
-        button.layer.borderColor = UIColor.blue.cgColor
-        button.titleLabel?.font = UIFont.systemFont(ofSize: 14)
-        button.addTarget(self, action: action, for: .touchUpInside)
-        return button
-    }
-    
-
-    // Add this method to toggle auto-detection mode
-    //
-    // Update autoDetectButtonTapped to clean up button
-    @objc private func autoDetectButtonTapped() {
-        isDetectionModeActive = !isDetectionModeActive
-        
-        // Clean up
-        ballAnchor?.removeFromParent()
-        ballAnchor = nil
-        confirmButton?.removeFromSuperview()
-        confirmButton = nil
-        
-        if isDetectionModeActive {
-            currentMode = .autoDetection
-            infoLabel.text = "ゴルフボールとホールを検出中..."
-        } else {
-            currentMode = .scanning
-            infoLabel.text = "グリーンをスキャン中..."
-            currentDetections = []
-        }
-    }
-    
-    //
-    // Add this method to process frames using YOLO
-    //
-    private func processCurrentFrame() {
-        guard isDetectionModeActive,
-              let frame = arView.session.currentFrame else {
-            return
-        }
-        // Skip processing entirely if both positions are locked
-        if isBallPositionLocked && isHolePositionLocked {
-            return
-        }
-
-
-        // Check if enough time has passed since last processing
-        let currentTime = Date().timeIntervalSince1970
-        guard currentTime - lastProcessedTime > processingInterval else {
-            return
-        }
-        
-        lastProcessedTime = currentTime
-        
-        let pixelBuffer = frame.capturedImage
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        
-        let context = CIContext(options: nil)
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return }
-        let uiImage = UIImage(cgImage: cgImage)
-        
-        // Process with YOLO detector
-        yoloDetector?.detectObjects(in: uiImage) { [weak self] detections in
-            guard let self = self else { return }
-            
-            DispatchQueue.main.async {
-                // Update detection overlay
-                self.currentDetections = detections
-                
-                var foundBall = false
-                var foundHole = false
-                
-                // Find ball and hole detections
-                for detection in detections {
-                    let className = detection.className.lowercased()
-                    print("Detection: \(className), confidence: \(detection.confidence), center: \(detection.boundingBox.midX), \(detection.boundingBox.midY)")
-                    
-                    // Convert detection coordinates to ARView screen coordinates
-                    let screenPoint = self.convertToARViewCoordinates(detection.boundingBox)
-                    
-                    if className == "golf ball" || className == "sports ball" && !self.isBallPositionLocked {
-                        foundBall = true
-                        // Existing ball detection code...
-                        self.isBallPositionLocked = true
-
-                        
-                        // Process ball detection
-                        if let result = self.arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .horizontal).first {
-                            // Remove any existing ball entity to avoid duplicates
-                            self.ballEntity?.removeFromParent()
-                            
-                            // Create ball entity if needed
-                            if self.ballEntity == nil {
-                                let ballMesh = MeshResource.generateSphere(radius: 0.02)
-                                let ballMaterial = SimpleMaterial(color: .white, isMetallic: false)
-                                self.ballEntity = ModelEntity(mesh: ballMesh, materials: [ballMaterial])
-                            }
-                            
-                            // Place ball
-                            let ballAnchor = AnchorEntity(world: result.worldTransform)
-                            ballAnchor.addChild(self.ballEntity!)
-                            self.arView.scene.addAnchor(ballAnchor)
-                            
-                            // Save position
-                            self.ballPosition = result.worldTransform.columns.3.xyz
-                        }
-                    }
-                    else if className == "golf hole" && !self.isHolePositionLocked {
-                        foundHole = true
-                        // Existing hole detection code...
-                        self.isHolePositionLocked = true
-
-                        
-                        // Process hole detection
-                        if let result = self.arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .horizontal).first {
-                            // Remove any existing hole entity to avoid duplicates
-                            self.holeEntity?.removeFromParent()
-                            
-                            // Create hole entity if needed
-                            if self.holeEntity == nil {
-                                let holeMesh = MeshResource.generateCylinder(height: 0.001, radius: 0.05)
-                                let holeMaterial = SimpleMaterial(color: .black, isMetallic: false)
-                                self.holeEntity = ModelEntity(mesh: holeMesh, materials: [holeMaterial])
-                            }
-                            
-                            // Place hole
-                            let holeAnchor = AnchorEntity(world: result.worldTransform)
-                            holeAnchor.addChild(self.holeEntity!)
-                            self.arView.scene.addAnchor(holeAnchor)
-                            
-                            // Save position
-                            self.holePosition = result.worldTransform.columns.3.xyz
-                        }
-                    }
-                }
-                
-                // If both ball and hole are detected, create line
-                if foundBall && foundHole && self.ballPosition != nil && self.holePosition != nil {
-                    // Remove any existing path
-                    self.pathEntity?.removeFromParent()
-                    
-                    // Create line connecting ball and hole
-                    self.createLineSegment(from: self.ballPosition!, to: self.holePosition!)
-                    
-                    // Calculate and display putting information
-                    self.calculatePuttPath()
-                    
-                    // Update status
-                    self.infoLabel.text = "パットラインを表示しています"
-                    self.currentMode = .viewing
-                }
-                else if foundBall {
-                    self.infoLabel.text = "ボールを検出しました。ホールを探しています..."
-                }
-                else if foundHole {
-                    self.infoLabel.text = "ホールを検出しました。ボールを探しています..."
-                }
-                else {
-                    self.infoLabel.text = "検出中です..."
-                }
-            }
-        }
-        if self.ballPosition != nil && self.holePosition != nil {
-            // Always update the line if both positions exist
-            self.pathEntity?.removeFromParent()
-            self.createLineSegment(from: self.ballPosition!, to: self.holePosition!)
-            self.calculatePuttPath()
-        }
-    }
-
-    
-    func convertToARViewCoordinates(_ boundingBox: CGRect) -> CGPoint {
-        guard let frame = arView.session.currentFrame else {
-            return CGPoint.zero
-        }
-        
-        // Get viewport size
-        let viewportSize = arView.bounds.size
-        
-        // Get the current interface orientation
-        let orientation = UIApplication.shared.windows.first?.windowScene?.interfaceOrientation ?? .portrait
-        
-        // Convert to normalized coordinates (0-1) in camera space
-        let normalizedX = boundingBox.midX / CGFloat(frame.camera.imageResolution.width)
-        let normalizedY = boundingBox.midY / CGFloat(frame.camera.imageResolution.height)
-        
-        // Use the current interface orientation for display transform
-        let normalizedPoint = CGPoint(x: normalizedX, y: normalizedY)
-        let displayTransform = frame.displayTransform(for: orientation, viewportSize: viewportSize)
-        let transformedPoint = normalizedPoint.applying(displayTransform)
-        
-        // Convert normalized viewport coordinates to absolute viewport coordinates
-        let viewportX = transformedPoint.x * viewportSize.width
-        let viewportY = transformedPoint.y * viewportSize.height
-        
-        print("Orientation-aware conversion: \(orientation.rawValue), (\(boundingBox.midX), \(boundingBox.midY)) → (\(viewportX), \(viewportY))")
-        
-        return CGPoint(x: viewportX, y: viewportY)
-    }
-    
-    // Add this method to handle button taps
-    @objc private func confirmButtonTapped() {
-        // Only proceed if we have an indicator
-        guard let anchor = ballAnchor else { return }
-        
-        // Get world position from the anchor
-        let worldPosition = anchor.position
-        
-        // Create real white ball
-        let ballMesh = MeshResource.generateSphere(radius: 0.02)
-        let ballMaterial = SimpleMaterial(color: .white, isMetallic: false)
-        ballEntity = ModelEntity(mesh: ballMesh, materials: [ballMaterial])
-        
-        // Create new anchor for permanent ball
-        let permanentAnchor = AnchorEntity()
-        permanentAnchor.position = worldPosition
-        permanentAnchor.addChild(ballEntity!)
-        arView.scene.addAnchor(permanentAnchor)
-        
-        // Save the position
-        ballPosition = worldPosition
-        
-        // Clean up
-        ballAnchor?.removeFromParent()
-        ballAnchor = nil
-        confirmButton?.removeFromSuperview()
-        confirmButton = nil
-        
-        // Update state
-        infoLabel.text = "ホール位置をタップしてください"
-        currentMode = .setHolePosition
-    }
-
-    
-    // Add this method to update detection info in the UI
-    //
-    private func updateDetectionInfo() {
-        guard currentMode == .autoDetection else { return }
-        
-        var ballDetected = false
-        var holeDetected = false
-        
-        for detection in currentDetections {
-            let className = detection.className.lowercased()
-            if className == "golf ball" {
-                ballDetected = true
-            } else if className == "golf hole" {
-                holeDetected = true
-            }
-        }
-        
-        // Update text label
-        if ballDetected && holeDetected {
-            infoLabel.text = "ボールとホールを検出しました。タップして確定してください。"
-        } else if ballDetected {
-            infoLabel.text = "ボールを検出しました。タップして確定してください。"
-        } else if holeDetected {
-            infoLabel.text = "ホールを検出しました。タップして確定してください。"
-        } else {
-            infoLabel.text = "検出中です..."
-        }
-    }
-
-    
-    
-    
-    // Add this method to handle the advice button tap
-    // Modify getAdviceButtonTapped to include fallback
-    @objc private func getAdviceButtonTapped() {
-        // Update the info label
-        infoLabel.text = "アドバイスを取得中..."
-        
-        // Get putting data
-        let puttData = getPuttingDataForAdvice()
-        
-        if greenImage == nil {
-            // Try to capture the image right now
-            if let frame = arView.session.currentFrame {
-                let pixelBuffer = frame.capturedImage
-                let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-                let context = CIContext(options: nil)
-                if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
-                    self.greenImage = captureARViewWithPuttLine()
-                    
-                    print("LOG: Green image captured during advice request")
-                }
-            }
-        }
-        
-        // Initialize ChatGPT service
-        let chatGPTService = ChatGPTService(apiKey: "")
-        
-        // Start a timeout timer
-        var hasTimedOut = false
-        let timeoutTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
-            hasTimedOut = true
-            let offlineAdvice = self?.getOfflineAdvice() ?? "アドバイスを生成できません"
-            self?.infoLabel.text = offlineAdvice
-            self?.speakAdvice(offlineAdvice)
-        }
-        
-        // Get advice from ChatGPT
-        chatGPTService.getPuttingAdvice(puttData: puttData, image: greenImage) { [weak self] advice, error in
-            // Cancel timeout timer
-            timeoutTimer.invalidate()
-            
-            // Only proceed if timeout hasn't occurred
-            if !hasTimedOut {
-                DispatchQueue.main.async {
-                    if let error = error {
-                        let offlineAdvice = self?.getOfflineAdvice() ?? "アドバイスを生成できません"
-                        self?.infoLabel.text = offlineAdvice
-                        self?.speakAdvice(offlineAdvice)
-                    } else if let advice = advice {
-                        // Update the info label with the advice
-                        self?.infoLabel.text = advice
-                        
-                        // Speak the advice
-                        self?.speakAdvice(advice)
-                    }
-                }
-            }
-        }
-    }
-    
-    // Capture the entire AR view including all virtual elements
-    func captureARViewWithPuttLine() -> UIImage? {
-        // Create a new context with the same size as the AR view
-        UIGraphicsBeginImageContextWithOptions(arView.bounds.size, false, UIScreen.main.scale)
-        
-        // Render the AR view into the context
-        if let context = UIGraphicsGetCurrentContext() {
-            arView.layer.render(in: context)
-            let image = UIGraphicsGetImageFromCurrentImageContext()
-            UIGraphicsEndImageContext()
-            print("LOG: Image get")
-            return image
-        }
-        
-        UIGraphicsEndImageContext()
-        return nil
-    }
-    
-    // Add this method to handle text-to-speech
-    private func speakAdvice(_ text: String) {
-        // Stop any ongoing speech
-        if speechSynthesizer.isSpeaking {
-            speechSynthesizer.stopSpeaking(at: .immediate)
-        }
-        
-        // Create utterance with Japanese voice
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: "ja-JP")
-        utterance.rate = 0.5
-        utterance.pitchMultiplier = 1.0
-        utterance.volume = 1.0
-        
-        // Speak
-        speechSynthesizer.speak(utterance)
-    }
-    // Add to ViewController.swift
-    private func getOfflineAdvice() -> String {
-        guard let ballPos = ballPosition, let holePos = holePosition else {
-            return "ボールとホールを設置してください"
-        }
-        
-        let slopeInfo = analyzeSlopeBetween(ballPos, holePos)
-        let distance = length(holePos - ballPos)
-        
-        // Simple rules for basic advice
-        var advice = ""
-        
-        if abs(slopeInfo.angle) < 1.0 {
-            advice += "ほぼ平らなグリーンです。ホールに直接狙いましょう。"
-        } else {
-            if slopeInfo.direction < 90 || slopeInfo.direction > 270 {
-                advice += "右から左への傾斜です。"
-                advice += "ホールの右側を狙いましょう。"
-            } else {
-                advice += "左から右への傾斜です。"
-                advice += "ホールの左側を狙いましょう。"
-            }
-        }
-        
-        if slopeInfo.angle > 1.0 {
-            advice += "上り傾斜なので、少し強めに打ちましょう。"
-        } else if slopeInfo.angle < -1.0 {
-            advice += "下り傾斜なので、優しく打ちましょう。"
-        }
-        
-        return advice
-    }
-    
-    
-    
-    // MARK: - AR Session Management
-    
-    private func startARSession() {
-        // Configure and start AR session
-        configuration.planeDetection = .horizontal
-        
-        // Enable LiDAR features if available
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
-            configuration.sceneReconstruction = .meshWithClassification
-            configuration.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
-        }
-        
-        // Set delegate to receive frame updates
-        arView.session.delegate = self
-        arView.session.run(configuration)
-    }
-    
-    // MARK: - User Interaction
-    
-    @objc private func ballButtonTapped() {
-        
-        // Allow switching from auto detection to manual hole placement
-        if isDetectionModeActive {
-            isDetectionModeActive = false
-        }
-        currentMode = .setBallPosition
-        infoLabel.text = "ボール位置をタップしてください"
-    }
-    
-    @objc private func holeButtonTapped() {
-        
-        // Allow switching from auto detection to manual hole placement
-        if isDetectionModeActive {
-            isDetectionModeActive = false
-        }
-        currentMode = .setHolePosition
-        infoLabel.text = "ホール位置をタップしてください"
-    }
-    
-    // Complete replacement for handleTap that ensures taps work anywhere on screen
-    // This completely replaces your existing handleTap method
-
-    @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
-        print("Tap detected")
-        let location = recognizer.location(in: view) // Use main view, not arView
-        
-        // Handle auto detection mode first - ANY tap confirms
-        if currentMode == .autoDetection && ballAnchor != nil {
-            print("Placing ball from auto detection")
-            
-            // Get the position from our indicator
-            let worldPosition = ballAnchor!.position
-            
-            // Remove the indicator
-            ballAnchor?.removeFromParent()
-            ballAnchor = nil
-            
-            // Create and place the permanent white ball
-            let ballMesh = MeshResource.generateSphere(radius: 0.02)
-            let ballMaterial = SimpleMaterial(color: .white, isMetallic: false)
-            ballEntity = ModelEntity(mesh: ballMesh, materials: [ballMaterial])
-            
-            let ballEntityAnchor = AnchorEntity()
-            ballEntityAnchor.position = worldPosition
-            ballEntityAnchor.addChild(ballEntity!)
-            arView.scene.addAnchor(ballEntityAnchor)
-            
-            // Save position
-            ballPosition = worldPosition
-            
-            // Update mode and UI
-            infoLabel.text = "ホール位置をタップしてください"
-            currentMode = .setHolePosition
-            return
-        }
-        
-        // For other modes, use the location in AR view
-        let arLocation = recognizer.location(in: arView)
-        
-        switch currentMode {
-        case .scanning, .autoDetection:
-            // Do nothing in these modes
-            print("Tap in scanning/autodetection mode (no action)")
-            break
-            
-        case .setBallPosition:
-            print("Placing ball via manual tap")
-            print("DEBUG: Manual tap location: x=\(arLocation.x), y=\(arLocation.y)")
-            placeBall(at: arLocation)
-            
-        case .setHolePosition:
-            print("Placing hole via manual tap")
-            placeHole(at: arLocation)
-            
-        case .viewing:
-            // Do nothing in viewing mode
-            print("Tap in viewing mode (no action)")
-            break
-        }
-    }
-    // Add this helper method to place objects from detection
-    //
-    // Helper method to place objects from detection
-    private func placeObjectAtScreenPosition(_ position: CGPoint, isBall: Bool) {
-        if isBall {
-            // Switch to ball placement mode and place
-            currentMode = .setBallPosition
-            placeBall(at: position)
-        } else {
-            // Switch to hole placement mode and place
-            currentMode = .setHolePosition
-            placeHole(at: position)
-        }
-    }
-
-    
-    private func placeBall(at screenPosition: CGPoint) {
-        // Raycast to find 3D position on detected plane
-        if let result = arView.raycast(from: screenPosition, allowing: .estimatedPlane, alignment: .horizontal).first {
-            // Remove existing ball if any
-            ballEntity?.removeFromParent()
-            
-            // Create a white sphere for the ball
-            let ballMesh = MeshResource.generateSphere(radius: 0.02)
-            let ballMaterial = SimpleMaterial(color: .white, isMetallic: false)
-            ballEntity = ModelEntity(mesh: ballMesh, materials: [ballMaterial])
-            
-            // Place the ball using an anchor
-            let ballAnchor = AnchorEntity(world: result.worldTransform)
-            ballAnchor.addChild(ballEntity!)
-            arView.scene.addAnchor(ballAnchor)
-            
-            // Save position
-            ballPosition = result.worldTransform.columns.3.xyz
-            
-            // Update mode and UI
-            infoLabel.text = "ホール位置をタップしてください"
-            currentMode = .setHolePosition
-            // In placeBall:
-            isBallPositionLocked = true
-
-        }
-    }
-    
-    private func placeHole(at screenPosition: CGPoint) {
-        // Raycast to find 3D position on detected plane
-        if let result = arView.raycast(from: screenPosition, allowing: .estimatedPlane, alignment: .horizontal).first {
-            // Remove existing hole if any
-            holeEntity?.removeFromParent()
-            
-            // Create a cylinder for the hole
-            let holeMesh = MeshResource.generateCylinder(height: 0.001, radius: 0.05)
-            let holeMaterial = SimpleMaterial(color: .black, isMetallic: false)
-            holeEntity = ModelEntity(mesh: holeMesh, materials: [holeMaterial])
-            
-            // Place the hole using an anchor
-            let holeAnchor = AnchorEntity(world: result.worldTransform)
-            holeAnchor.addChild(holeEntity!)
-            arView.scene.addAnchor(holeAnchor)
-            
-            // In placeHole:
-            isHolePositionLocked = true
-
-            
-            // Save position
-            holePosition = result.worldTransform.columns.3.xyz
-            
-            // Calculate and display the putt path
-            calculatePuttPath()
-            
-            // Update mode and UI
-            infoLabel.text = "パットラインを表示しています"
-            currentMode = .viewing
-        }
-    }
-    
-    // Modify your resetButtonTapped to also clear detections
-    //
-    @objc private func resetButtonTapped() {
-        // Clear all anchors from the scene
-        arView.scene.anchors.removeAll()
-        
-        isBallPositionLocked = false
-        isHolePositionLocked = false
-
-        // Explicitly set all entities to nil
-        ballEntity = nil
-        holeEntity = nil
-        pathEntity = nil
-        ballIndicator = nil
-        ballAnchor = nil
-        
-        // Clear positions
-        ballPosition = nil
-        holePosition = nil
-        
-        // Reset detection state
-        isDetectionModeActive = false
-        currentDetections = []
-        
-        // Reset mode
-        currentMode = .scanning
-        
-        // Reset UI
-        infoLabel.text = "グリーンをスキャン中..."
-        
-        // Restart AR session with complete reset
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = .horizontal
-        
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
             config.sceneReconstruction = .meshWithClassification
             config.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
         }
+        arView.session.delegate = self
+        arView.session.run(config)
+    }
+
+    // MARK: - Setup Methods
+    private func setupARView() {
+        arView = ARView(frame: view.bounds)
+        arView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(arView)
+    }
+
+    private func setupUI() {
         
-        // This is the most aggressive reset possible
-        arView.session.run(config, options: [.resetTracking, .removeExistingAnchors, .resetSceneReconstruction])
+        infoTextView = UITextView()
+        infoTextView.translatesAutoresizingMaskIntoConstraints = false
+        infoTextView.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        infoTextView.textColor = .white
+        infoTextView.textAlignment = .center
+        infoTextView.isEditable = false
+        infoTextView.isSelectable = false
+        infoTextView.font = UIFont.systemFont(ofSize: 14)
+        infoTextView.text = "Tap 'Set Ball' to begin"
+        infoTextView.layer.cornerRadius = 8
+        infoTextView.clipsToBounds = true
+        infoTextView.contentInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+        view.addSubview(infoTextView)
+        
+        
+        // Set Ball Button
+        setBallButton = UIButton(type: .system)
+        setBallButton.translatesAutoresizingMaskIntoConstraints = false
+        setBallButton.setTitle("Set Ball", for: .normal)
+        setBallButton.backgroundColor = .systemBlue
+        setBallButton.setTitleColor(.white, for: .normal)
+        setBallButton.layer.cornerRadius = 8
+        setBallButton.addTarget(self, action: #selector(setBallTapped), for: .touchUpInside)
+        view.addSubview(setBallButton)
+        
+        // Set Hole Button
+        setHoleButton = UIButton(type: .system)
+        setHoleButton.translatesAutoresizingMaskIntoConstraints = false
+        setHoleButton.setTitle("Set Hole", for: .normal)
+        setHoleButton.backgroundColor = .systemGreen
+        setHoleButton.setTitleColor(.white, for: .normal)
+        setHoleButton.layer.cornerRadius = 8
+        setHoleButton.addTarget(self, action: #selector(setHoleTapped), for: .touchUpInside)
+        setHoleButton.isEnabled = false // Disabled until ball is placed
+        view.addSubview(setHoleButton)
+
+        // Reset Button
+        resetButton = UIButton(type: .system)
+        resetButton.translatesAutoresizingMaskIntoConstraints = false
+        resetButton.setTitle("Reset", for: .normal)
+        resetButton.backgroundColor = .systemRed
+        resetButton.setTitleColor(.white, for: .normal)
+        resetButton.layer.cornerRadius = 8
+        resetButton.addTarget(self, action: #selector(resetTapped), for: .touchUpInside)
+        view.addSubview(resetButton)
+        
+        // Layout constraints
+        NSLayoutConstraint.activate([
+            infoTextView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+            infoTextView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            infoTextView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            infoTextView.heightAnchor.constraint(equalToConstant: 100), // Increased height for scrolling
+            
+
+            setBallButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
+            setBallButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            setBallButton.widthAnchor.constraint(equalToConstant: 100),
+            setBallButton.heightAnchor.constraint(equalToConstant: 44),
+            
+            setHoleButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
+            setHoleButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            setHoleButton.widthAnchor.constraint(equalToConstant: 100),
+            setHoleButton.heightAnchor.constraint(equalToConstant: 44),
+            
+            resetButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
+            resetButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            resetButton.widthAnchor.constraint(equalToConstant: 100),
+            resetButton.heightAnchor.constraint(equalToConstant: 44)
+        ])
+        
     }
     
-}
+    
+    private func debugTerrainCoverage() {
+        guard let ball = ballPosition, let hole = holePosition else { return }
+        
+        print("\n=== TERRAIN COVERAGE ANALYSIS ===")
+        print("Ball position: \(ball)")
+        print("Hole position: \(hole)")
+        print("Total unique sample positions: \(terrainSampleBuffer.count)")
+        
+        // Calculate the direct path vector
+        let pathVector = normalize(SIMD3<Float>(hole.x - ball.x, 0, hole.z - ball.z))
+        let distance = length(SIMD3<Float>(hole.x - ball.x, 0, hole.z - ball.z))
+        
+        // Check coverage along the direct path
+        let segments = 10
+        var coveredSegments = 0
+        
+        print("\nChecking coverage along 10 path segments:")
+        for i in 0...segments {
+            let t = Float(i) / Float(segments)
+            let checkPoint = SIMD3<Float>(
+                ball.x + t * (hole.x - ball.x),
+                0, // Y not used for lookup
+                ball.z + t * (hole.z - ball.z)
+            )
+            
+            // Look for any sample within 3cm of this point
+            var foundSample = false
+            let searchRadius: Float = 0.03
+            
+            for (samplePos, _) in terrainSampleBuffer {
+                let dx = samplePos.x - checkPoint.x
+                let dz = samplePos.z - checkPoint.z
+                let dist = sqrt(dx*dx + dz*dz)
+                
+                if dist < searchRadius {
+                    foundSample = true
+                    break
+                }
+            }
+            
+            if foundSample {
+                coveredSegments += 1
+                print("Segment \(i)/\(segments): ✓ Covered")
+            } else {
+                print("Segment \(i)/\(segments): ✗ NOT COVERED")
+            }
+        }
+        
+        print("\nPath coverage: \(coveredSegments)/\(segments+1) segments (\(Int(Float(coveredSegments) / Float(segments+1) * 100))%)")
+        print("=================================\n")
+    }
+    
+    
+    
+    // Helper method to get surface height using ARKit
+    private func getSurfaceHeightForSampling(at position: SIMD3<Float>) -> Float? {
+        // First try LiDAR if device supports it
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth),
+           let frame = arView.session.currentFrame,
+           let depthMap = frame.sceneDepth?.depthMap {
+            
+            // Project position to screen space to get a 2D point
+            if let screenPoint = arView.project(position) {
+                // Extract depth value from the depth map
+                // Get depth map dimensions
+                let depthWidth = CVPixelBufferGetWidth(depthMap)
+                let depthHeight = CVPixelBufferGetHeight(depthMap)
+                
+                // Convert screen point to depth map coordinates
+                let normalizedX = Float(screenPoint.x) / Float(arView.bounds.width)
+                let normalizedY = Float(screenPoint.y) / Float(arView.bounds.height)
+                let depthX = Int(normalizedX * Float(depthWidth))
+                let depthY = Int(normalizedY * Float(depthHeight))
+                
+                // Ensure coordinates are valid
+                if depthX >= 0 && depthX < depthWidth && depthY >= 0 && depthY < depthHeight {
+                    // Access depth data
+                    CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+                    defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+                    
+                    // Get depth value
+                    let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+                    let baseAddress = CVPixelBufferGetBaseAddress(depthMap)!
+                    let depthValue = baseAddress.advanced(by: depthY * bytesPerRow + depthX * MemoryLayout<Float32>.size)
+                        .assumingMemoryBound(to: Float32.self).pointee
+                    
+                    if depthValue > 0 {
+                        // Use ARKit's standard raycast with this screen point
+                        // This will get a world position that's properly aligned with ARKit's coordinate system
+                        let results = arView.raycast(
+                            from: screenPoint,
+                            allowing: .estimatedPlane,
+                            alignment: .any
+                        )
+                        
+                        if let firstResult = results.first {
+                            // Extract the Y value from the result's transform
+                            let worldY = firstResult.worldTransform.columns.3.y
+                            
+       //                     print("DEBUG: Depth: \(depthValue), ARKit World Y: \(worldY)")
+                            
+                            return worldY
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fallback to standard raycast
+        let rayOrigin = SIMD3<Float>(position.x, position.y + 0.5, position.z)
+        let rayDirection = SIMD3<Float>(0, -1, 0)
+        
+        // Method 1: RealityKit scene raycast
+        let sceneResults = arView.scene.raycast(
+            origin: rayOrigin,
+            direction: rayDirection,
+            length: 1.0,
+            query: .nearest
+        )
+        
+        if let hit = sceneResults.first {
+            return hit.position.y
+        }
+        
+        // Method 2: ARKit raycast
+        if let screenPoint = arView.project(rayOrigin) {
+            let results = arView.raycast(
+                from: screenPoint,
+                allowing: .estimatedPlane,
+                alignment: .any
+            )
+            
+            if let firstResult = results.first {
+                return firstResult.worldTransform.columns.3.y
+            }
+        }
+        
+        return position.y
+    }
+    
+    // MARK: - Mode Selection
+    @objc private func setBallTapped() {
+        currentMode = .ball
+        infoTextView.text = "Tap on surface to place the ball"
+    }
+    
+    @objc private func setHoleTapped() {
+        currentMode = .hole
+        infoTextView.text = "Tap on surface to place the hole"
+        // Clear any existing terrain data when preparing to place a new hole
+        terrainSampleBuffer.removeAll()
+    }
 
-
-// Extension for path calculation and visualization
-extension ViewController {
-    // Calculate putt path based on ball and hole positions
-    // Simplified calculatePuttPath function - fallback to basic path rendering
-    private func calculatePuttPath() {
-        guard let ballPos = ballPosition, let holePos = holePosition else {
-            print("Ball or hole position is missing")
+    // MARK: - Tap Handling
+    // Also update handleTap method to ensure accurate position detection
+    @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+        let pt = gesture.location(in: arView)
+        
+        // Try raycast against real world planes first
+        if let result = arView.raycast(from: pt, allowing: .estimatedPlane, alignment: .horizontal).first {
+            // Use raycast result for more accurate position
+            let worldPos = SIMD3<Float>(
+                result.worldTransform.columns.3.x,
+                result.worldTransform.columns.3.y,
+                result.worldTransform.columns.3.z
+            )
+            
+            print("Raycast hit at: \(worldPos)")
+            
+            switch currentMode {
+            case .ball:
+                placeBall(at: worldPos)
+            case .hole:
+                placeHole(at: worldPos)
+            case .none:
+                infoTextView.text = "Select 'Set Ball' or 'Set Hole' first"
+            }
             return
         }
         
-        // Get basic slope info
-        let slopeInfo = analyzeSlopeBetween(ballPos, holePos)
-        print("DATA CHECK: Basic slope analysis - angle: \(slopeInfo.angle)°, direction: \(slopeInfo.direction)°")
-        
-        // Remove any existing path
-        pathEntity?.removeFromParent()
-        
-        // Check if LiDAR is available and working properly
-        var useLiDAR = false
-        
-        // In calculatePuttPath()
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification),
-           let frame = arView.session.currentFrame,
-           frame.sceneDepth != nil {
-            // Always use LiDAR when available
-            useLiDAR = true
-            print("LIDAR CHECK: LiDAR will be used despite limited world mapping")
+        // Fallback to the previous method if raycast fails
+        guard let worldPos = DefaultARInputProvider.worldPosition(at: pt, in: arView) else {
+            infoTextView.text = "No depth available at tap point. Try again."
+            return
         }
         
-        // Add this detailed debug code to your calculatePuttPath function
-        print("LIDAR CHECK: Device supports scene reconstruction: \(ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification))")
-        if let frame = arView.session.currentFrame {
-            print("LIDAR CHECK: Frame available: true")
-            print("LIDAR CHECK: Scene depth available: \(frame.sceneDepth != nil)")
-            print("LIDAR CHECK: World mapping status: \(frame.worldMappingStatus)")
-            
-            // 0 = .notAvailable, 1 = .limited, 2 = .extending, 3 = .mapped
-            print("LIDAR CHECK: World mapping status (raw): \(frame.worldMappingStatus.rawValue)")
-        } else {
-            print("LIDAR CHECK: No frame available")
+        print("Fallback position method used: \(worldPos)")
+        
+        switch currentMode {
+        case .ball:
+            placeBall(at: worldPos)
+        case .hole:
+            placeHole(at: worldPos)
+        case .none:
+            infoTextView.text  = "Select 'Set Ball' or 'Set Hole' first"
         }
-        
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification),
-           let frame = arView.session.currentFrame,
-           frame.sceneDepth != nil,
-           frame.worldMappingStatus != .limited {
-            
-            useLiDAR = true
-            print("DATA CHECK: LiDAR is available and will be used")
-        } else {
-            print("DATA CHECK: LiDAR not available or limited, using basic slope only")
-        }
-        
-        if useLiDAR {
-            // Use a local autorelease pool to manage resources
-            autoreleasepool {
-                // Track processing time for performance monitoring
-                let startTime = CFAbsoluteTimeGetCurrent()
-                
-                // Try to get detailed slope analysis
-                if let detailedSlopeInfo = analyzePuttingGreen() {
-                    // Check if processing took too long
-                    let processingTime = CFAbsoluteTimeGetCurrent() - startTime
-                    // タプルから slopeMap を取り出す
-                    //                   let slopeMap = detailedSlopeInfo.slopeMap
-                    
-                    
-                    print("DATA CHECK: LiDAR analysis complete in \(processingTime)s")
-                    print("DATA CHECK: Grid size: \(detailedSlopeInfo.slopeMap.count)x\(detailedSlopeInfo.slopeMap.first?.count ?? 0)")
-                    
-                    
-                    if let sampleSlope = detailedSlopeInfo.slopeMap.first?.first {
-                        print("DATA CHECK: Sample slope vector: \(sampleSlope), magnitude: \(length(sampleSlope))")
-                    }
-                    
-                    if processingTime < 0.5 { // Only use enhanced path if processing was fast enough
-                        // Create enhanced path
-                        createAdvancedPuttPath(from: ballPos, to: holePos, slopeData: detailedSlopeInfo.slopeMap)
-                        print("DATA CHECK: Using advanced LiDAR-based path")
-                        
-                        // Display enhanced info
-                        //             displayEnhancedSlopeInfo(slopeInfo, detailedSlopeInfo.slopeMap)
-                        displayEnhancedSlopeInfo((angle: slopeInfo.angle, direction: slopeInfo.direction), detailedSlopeInfo.slopeMap)
-                        return // Skip basic path creation
-                    } else {
-                        print("DATA CHECK: LiDAR processing took too long, falling back to basic path")
-                    }
-                } else {
-                    print("DATA CHECK: LiDAR analysis failed to produce data")
-                }
-            }
-        }
-        
-        // Fallback to basic path if LiDAR analysis failed or was too slow
-        print("DATA CHECK: Creating basic path with curve offset calculation")
-        
-        // Calculate curve parameters before calling the function to verify the data
-        let slopeDirectionRad = slopeInfo.direction * Float.pi / 180.0
-        let perpVector = SIMD3<Float>(
-            cos(slopeDirectionRad + Float.pi/2),
-            0,
-            sin(slopeDirectionRad + Float.pi/2)
-        )
-        let directVector = holePos - ballPos
-        let midpoint = ballPos + directVector * 0.5
-        let curveOffset = abs(slopeInfo.angle) * 0.015
-        let curvedMidpoint = midpoint + perpVector * curveOffset
-        
-        print("DATA CHECK: Curve calculation - angle: \(slopeInfo.angle)°")
-        print("DATA CHECK: Curve offset: \(curveOffset)")
-        print("DATA CHECK: Midpoint: \(midpoint)")
-        print("DATA CHECK: Curved midpoint: \(curvedMidpoint)")
-        print("DATA CHECK: Offset distance: \(distance(midpoint, curvedMidpoint))")
-        
-        //       createBasicPuttPath(from: ballPos, to: holePos, slopeInfo: slopeInfo)
-        createBasicPuttPath(from: ballPos, to: holePos, slopeInfo: (angle: slopeInfo.angle, direction: slopeInfo.direction))
-        
-        // Display basic slope information
-        //      displaySlopeInfo(slopeInfo)
-        let heightDifference = holePosition!.y - ballPosition!.y
-        displaySlopeInfo((angle: slopeInfo.angle, direction: slopeInfo.direction), heightDiff: heightDifference)
-        //        displaySlopeInfo((angle: slopeInfo.angle, direction: slopeInfo.direction))
-        
-        if let capturedImage = captureARViewWithPuttLine() {
-            self.greenImage = capturedImage
-            print("LOG: Green image successfully captured.")
-        } else {
-            print("LOG: Error capturing green image.")
-        }
-        
-        
     }
-    
-    
-    // Function to create advanced putt path visualization using detailed LiDAR data
-    private func createAdvancedPuttPath(from start: SIMD3<Float>, to end: SIMD3<Float>, slopeData: [[SIMD2<Float>]]) {
-        // Remove any existing path
-        pathEntity?.removeFromParent()
-        
-        // Calculate direct vector and distance
-        let directVector = end - start
-        let directDistance = length(directVector)
-        
-        // Create sample points along path based on slope data
-        let pointCount = 30
-        var pathPoints: [SIMD3<Float>] = []
-        
-        // Generate path with physics-based curvature using the slope data
-        for i in 0...pointCount {
-            let t = Float(i) / Float(pointCount)
-            
-            // Start with linear interpolation
-            let position = start + directVector * t
-            
-            // Find nearest grid points to this position
-            let gridSize = slopeData.count
-            let gridSpacing: Float = 0.05 // Must match value in analyzePuttingGreen
-            
-            // Calculate grid indices
-            let gridX = Int((position.x - start.x) / gridSpacing + Float(gridSize) / 2)
-            let gridZ = Int((position.z - start.z) / gridSpacing + Float(gridSize) / 2)
-            
-            // Check if indices are within bounds
-            if gridX >= 0 && gridX < gridSize && gridZ >= 0 && gridZ < gridSize {
-                // Get slope at this position
-                let slope = slopeData[gridZ][gridX]
-                
-                // Apply slope-based offset (perpendicular to slope direction)
-                let slopeMagnitude = length(slope)
-                if slopeMagnitude > 0.01 {
-                    // Calculate perpendicular vector to slope
-                    let slopeDirection = normalize(slope)
-                    let perpVector = SIMD3<Float>(-slopeDirection.y, 0, slopeDirection.x)
-                    
-                    // Apply curve based on slope (stronger in middle of path)
-                    let curveStrength = slopeMagnitude * 0.3 * sin(t * .pi)
-                    
-                    // Add offset perpendicular to slope
-                    let offsetPosition = position + perpVector * curveStrength
-                    pathPoints.append(offsetPosition)
-                } else {
-                    pathPoints.append(position)
-                }
-            } else {
-                pathPoints.append(position)
-            }
+
+    // Update ball placement method
+    private func placeBall(at position: SIMD3<Float>) {
+        // Remove existing ball if present
+        if let existing = ballAnchor {
+            arView.scene.removeAnchor(existing)
         }
         
-        // Create visual representation of the path using the calculated points
-        createPathVisualization(points: pathPoints)
-    }
-    
-    // Function for basic putt path (based on existing implementation)
-    private func createBasicPuttPath(from start: SIMD3<Float>, to end: SIMD3<Float>, slopeInfo: (angle: Float, direction: Float)) {
-        // Remove any existing path
-        pathEntity?.removeFromParent()
+        // Debug logging
+        print("Placing ball at world position: \(position)")
         
-        // Calculate a curved midpoint based on slope
-        let slopeDirectionRad = slopeInfo.direction * Float.pi / 180.0
-        
-        // Calculate perpendicular vector for curve offset
-        let perpVector = SIMD3<Float>(
-            cos(slopeDirectionRad + Float.pi/2),
-            0,
-            sin(slopeDirectionRad + Float.pi/2)
+        // Create new ball
+        let sphere = ModelEntity(
+            mesh: .generateSphere(radius: 0.02),
+            materials: [SimpleMaterial(color: .white, isMetallic: false)]
         )
         
-        // Create a curved midpoint
-        let directVector = end - start
-        let directDistance = length(directVector)
-        let midpoint = start + directVector * 0.5
-        
-        // Apply curve offset - adjust multiplier to control curve amount
-        let curveOffset = abs(slopeInfo.angle) * 0.015
-        let curvedMidpoint = midpoint + perpVector * curveOffset
-        
-        // Create first segment (ball to midpoint)
-        createLineSegment(from: start, to: curvedMidpoint)
-        
-        // Create second segment (midpoint to hole)
-        createLineSegment(from: curvedMidpoint, to: end)
-    }
-    
-    // Function to display enhanced slope information
-    private func displayEnhancedSlopeInfo(_ basicInfo: (angle: Float, direction: Float), _ detailedInfo: [[SIMD2<Float>]]) {
-        // Format slope angle
-        let angleText = String(format: "傾斜角度: %.1f°", abs(basicInfo.angle))
-        
-        // Format slope direction
-        let directionText = getDirectionText(degrees: basicInfo.direction)
-        
-        // Calculate average and maximum slope from detailed data
-        var totalMagnitude: Float = 0
-        var maxMagnitude: Float = 0
-        var count = 0
-        
-        for row in detailedInfo {
-            for slope in row {
-                let magnitude = length(slope)
-                totalMagnitude += magnitude
-                maxMagnitude = max(maxMagnitude, magnitude)
-                count += 1
-            }
-        }
-        
-        let avgSlope = count > 0 ? (totalMagnitude / Float(count)) : 0
-        
-        // Enhanced info text
-        let enhancedText = String(format: "詳細分析: 平均傾斜 %.1f°, 最大傾斜 %.1f°",
-                                  avgSlope * 57.3, // Convert to degrees
-                                  maxMagnitude * 57.3) // Convert to degrees
-        
-        // Update info label
-        infoLabel.text = "\(angleText) \(directionText)方向\n\(enhancedText)"
-    }
-    
-    
-    // Helper method to create a line segment
-    private func createLineSegment(from start: SIMD3<Float>, to end: SIMD3<Float>) {
-        // Calculate distance
-        let distance = simd_distance(start, end)
-        
-        // Create cylinder
-        let pathMesh = MeshResource.generateCylinder(height: distance, radius: 0.01)
-        let pathMaterial = SimpleMaterial(color: .red, isMetallic: false)
-        let path = ModelEntity(mesh: pathMesh, materials: [pathMaterial])
-        
-        // Create anchor at start position
-        let anchor = AnchorEntity(world: start)
-        anchor.addChild(path)
-        
-        // Calculate direction
-        let direction = normalize(end - start)
-        
-        // Orient cylinder
-        let defaultDirection = SIMD3<Float>(0, 1, 0)
-        let rotationAxis = cross(defaultDirection, direction)
-        let rotationAngle = acos(dot(defaultDirection, direction))
-        
-        if length(rotationAxis) > 0.001 && !rotationAngle.isNaN {
-            path.orientation = simd_quaternion(rotationAngle, normalize(rotationAxis))
-        }
-        
-        // Position cylinder
-        path.position = direction * (distance / 2)
-        
-        // Add to scene
+        // Create anchor exactly at the position
+        let anchor = AnchorEntity(world: position)
+        anchor.addChild(sphere)
         arView.scene.addAnchor(anchor)
+        
+        ballAnchor = anchor
+        ballPosition = position  // Store the exact world position
+        
+        // Update UI state
+        currentMode = .none
+        setHoleButton.isEnabled = true
+        infoTextView.text  = "Ball placed. Now tap 'Set Hole'."
     }
     
-    // Generate curved path points based on slope
-    private func generateCurvedPathPoints(from start: SIMD3<Float>, to end: SIMD3<Float>, slopeInfo: (angle: Float, direction: Float)) -> [SIMD3<Float>] {
-        let pointCount = 10
-        var points: [SIMD3<Float>] = []
-        
-        // Convert slope direction to radians
-        let slopeDirectionRad = slopeInfo.direction * Float.pi / 180.0
-        
-        // Calculate curve magnitude based on slope angle
-        let curveMagnitude = abs(slopeInfo.angle) * 0.02 // Adjust this multiplier as needed
-        
-        // Calculate perpendicular vector to the direct line in horizontal plane
-        let directVector = SIMD3<Float>(end.x - start.x, 0, end.z - start.z)
-        let perpVector = normalize(SIMD3<Float>(
-            cos(slopeDirectionRad + Float.pi/2),
-            0,
-            sin(slopeDirectionRad + Float.pi/2)
-        ))
-        
-        // Generate curved path points
-        for i in 0...pointCount {
-            let t = Float(i) / Float(pointCount)
-            
-            // Start with linear interpolation
-            let linearPos = start + (end - start) * t
-            
-            // Add curve offset (maximum at middle of path)
-            let curveOffset = sin(t * Float.pi) * curveMagnitude
-            let curvedPos = linearPos + perpVector * curveOffset
-            
-            points.append(curvedPos)
+    // Update the placeHole method to improve hole position accuracy
+
+    // Update placeHole method
+    private func placeHole(at position: SIMD3<Float>) {
+        // Remove existing hole if present
+        if let existing = holeAnchor {
+            arView.scene.removeAnchor(existing)
         }
         
-        return points
+        // Debug logging
+        print("Placing hole at world position: \(position)")
+        
+        // Create hole indicator using a cylinder
+        let ringMesh = MeshResource.generateCylinder(height: 0.002, radius: 0.04)
+        let material = SimpleMaterial(color: .red, isMetallic: false)
+        let ring = ModelEntity(mesh: ringMesh, materials: [material])
+        // Set ring orientation to lay flat on the ground
+        ring.transform.rotation = simd_quatf(angle: .pi/2, axis: [1,0,0])
+        
+        // Create center marker for better visibility
+        let centerMesh = MeshResource.generateSphere(radius: 0.005)
+        let centerMaterial = SimpleMaterial(color: .red, isMetallic: false)
+        let center = ModelEntity(mesh: centerMesh, materials: [centerMaterial])
+        
+        // Create anchor exactly at the position
+        let anchor = AnchorEntity(world: position)
+        anchor.addChild(ring)
+        anchor.addChild(center)
+        arView.scene.addAnchor(anchor)
+        
+        holeAnchor = anchor
+        holePosition = position  // Store the exact world position
+        
+        // Update UI state and start terrain collection
+        currentMode = .none
+        infoTextView.text  = "Collecting terrain data (0%)..."
+        startTerrainDataCollection()
     }
-    // Analyze slope between two points
-    private func analyzeSlopeBetween(_ startPoint: SIMD3<Float>, _ endPoint: SIMD3<Float>) -> (angle: Float, direction: Float, lateralSlope: Float) {
-        guard arView.session.currentFrame != nil else {
-            // Existing fallback processing
-            let basicSlope = calculateBasicSlope(startPoint, endPoint)
-            return (angle: basicSlope.angle, direction: basicSlope.direction, lateralSlope: 0)
-        }
-        
-        // Existing processing (sample point calculation)
-        let sampleCount = 8
-        var heightSamples: [Float] = []
-        
-        var totalWeight: Float = 0.0
-        var weightedHeight: Float = 0.0
-        
-        for i in 0...sampleCount {
-            let t = Float(i) / Float(sampleCount)
-            let position = simd_mix(startPoint, endPoint, SIMD3<Float>(t, t, t))
-            let weight = sin(t * Float.pi)
+
+    // このメソッド全体を置き換え
+    // Fix the startTerrainDataCollection method to ensure proper sampling
+    // Replace the collectTerrainSample method
+    private func collectTerrainSample(at position: SIMD3<Float>) {
+        // Get height using LiDAR
+        if let height = getSurfaceHeightForSampling(at: position) {
+            // Store samples at both the exact position (for precise lookups)
+            // and at grid-aligned positions (for mesh generation)
             
-            if let height = getHeightAt(position) {
-                weightedHeight += height * weight
-                totalWeight += weight
-                heightSamples.append(height)
+            // 1. Store at exact position for direct lookups (ball/hole)
+            let exactPosition = SIMD3<Float>(position.x, 0.0, position.z)
+            if terrainSampleBuffer[exactPosition] == nil {
+                terrainSampleBuffer[exactPosition] = []
             }
-        }
-        
-        // Existing processing (height and slope calculation)
-        let avgStartHeight = totalWeight > 0 ? weightedHeight / totalWeight : startPoint.y
-        let adjustedHeightDifference = endPoint.y - avgStartHeight
-        let horizontalDistance = sqrt(
-            pow(endPoint.x - startPoint.x, 2) +
-            pow(endPoint.z - startPoint.z, 2)
-        )
-        
-        // Calculate raw slope angle
-        let rawSlopeAngle = atan2(adjustedHeightDifference, horizontalDistance) * (180 / Float.pi)
-        
-        // Add reality check for indoor testing on flat surfaces
-        // Golf greens rarely exceed 4-5 degrees. For indoor flat surfaces, be more strict
-        let maxRealisticAngle: Float = 3.0
-        let slopeAngle = abs(rawSlopeAngle) <= maxRealisticAngle ? rawSlopeAngle : 0.0
-        
-        let directionVector = SIMD2<Float>(
-            endPoint.x - startPoint.x,
-            endPoint.z - startPoint.z
-        )
-        let directionAngle = atan2(directionVector.x, directionVector.y) * (180 / Float.pi)
-        let adjustedDirection = (directionAngle + 360).truncatingRemainder(dividingBy: 360)
-        
-        // Calculate lateral slope
-        let ballToHoleDirection = atan2(endPoint.x - startPoint.x, endPoint.z - startPoint.z)
-        let perpendicularVector = SIMD3<Float>(
-            cos(ballToHoleDirection + Float.pi/2),
-            0,
-            sin(ballToHoleDirection + Float.pi/2)
-        )
-        
-        // Calculate lateral slope with reality check
-        var lateralSlope: Float = 0
-        for i in 0...3 {
-            let t = Float(i) / 3.0
-            let linePos = simd_mix(startPoint, endPoint, SIMD3<Float>(t, t, t))
+            terrainSampleBuffer[exactPosition]?.append(height)
             
-            if let centerHeight = getHeightAt(linePos),
-               let rightHeight = getHeightAt(linePos + perpendicularVector * 0.05) {
-                let rawLateralSlope = (rightHeight - centerHeight) / 0.05
-                // Apply the same reality check to lateral slope
-                lateralSlope += abs(rawLateralSlope) <= maxRealisticAngle ? rawLateralSlope : 0.0
+            // 2. Also store at grid-aligned position for mesh
+            let resolution: Float = 0.20 // 20cm
+            let gridX = round(position.x / resolution) * resolution
+            let gridZ = round(position.z / resolution) * resolution
+            let gridPosition = SIMD3<Float>(gridX, 0.0, gridZ)
+            
+            if terrainSampleBuffer[gridPosition] == nil {
+                terrainSampleBuffer[gridPosition] = []
             }
-        }
-        lateralSlope /= 4.0 // Average
-        
-        // For debugging - log if we filtered out unrealistic slopes
-        if abs(rawSlopeAngle) > maxRealisticAngle {
-            print("DATA CHECK: Filtered unrealistic slope angle: \(rawSlopeAngle)° → 0°")
-        }
-        
-        return (angle: abs(slopeAngle), direction: adjustedDirection, lateralSlope: lateralSlope)
-    }
-    
-    // Fallback method for basic slope calculation
-    private func calculateBasicSlope(_ startPoint: SIMD3<Float>, _ endPoint: SIMD3<Float>) -> (angle: Float, direction: Float) {
-        let heightDifference = endPoint.y - startPoint.y
-        let horizontalDistance = sqrt(
-            pow(endPoint.x - startPoint.x, 2) +
-            pow(endPoint.z - startPoint.z, 2)
-        )
-        
-        let angle = atan2(heightDifference, horizontalDistance) * (180 / Float.pi)
-        
-        // Direction vector (top-down view)
-        let directionVector = SIMD2<Float>(
-            endPoint.x - startPoint.x,
-            endPoint.z - startPoint.z
-        )
-        if length(directionVector) > 0 {
-            let normalizedDirection = normalize(directionVector)
-            let direction = atan2(normalizedDirection.x, normalizedDirection.y) * (180 / Float.pi)
-            let adjustedDirection = (direction + 360).truncatingRemainder(dividingBy: 360)
-            return (angle: abs(angle), direction: adjustedDirection)
-        } else {
-            return (angle: abs(angle), direction: 0)
+            terrainSampleBuffer[gridPosition]?.append(height)
+            
+            print("Collected terrain sample: position=\(position), key=\(gridPosition), height=\(height)")
         }
     }
-    
-    // Helper methods for working with depth data
-    private func projectToScreenCoordinates(_ worldPosition: SIMD3<Float>, frame: ARFrame) -> CGPoint? {
-        _ = CGSize(width: frame.camera.imageResolution.width, height: frame.camera.imageResolution.height)
+
+    // Revise the startTerrainDataCollection method for better coverage
+    private func startTerrainDataCollection() {
+        guard let ball = ballPosition, let hole = holePosition else { return }
         
-        // Project the 3D point to 2D
-        let projection = frame.camera.projectionMatrix * simd_float4(worldPosition.x, worldPosition.y, worldPosition.z, 1)
+        if isCollectingTerrainData { return }
         
-        // Check if the point is in front of the camera
-        if projection.z > 0 {
-            // Convert to screen coordinates
-            return CGPoint(
-                x: CGFloat(projection.x / projection.z),
-                y: CGFloat(projection.y / projection.z)
-            )
+        // Clear any old data
+        terrainSampleBuffer.removeAll()
+        isCollectingTerrainData = true
+        collectionProgress = 0
+        
+        // Define consistent resolution
+        let resolution: Float = 0.20 // 20cm
+        let width: Float = 1.0 // 1 meter width
+        
+        // Calculate path vector and perpendicular vector
+        let pathVector = normalize(SIMD3<Float>(hole.x - ball.x, 0, hole.z - ball.z))
+        let sideVector = normalize(SIMD3<Float>(-pathVector.z, 0, pathVector.x))
+        let distance = length(SIMD3<Float>(hole.x - ball.x, 0, hole.z - ball.z))
+        
+        print("Starting terrain collection from \(ball) to \(hole), distance: \(distance)m")
+        
+        // First, sample EXACT ball and hole positions multiple times
+        print("Sampling exact ball and hole positions")
+        for _ in 0..<20 {
+            collectTerrainSample(at: ball)
+            collectTerrainSample(at: hole)
         }
         
-        return nil
-    }
-    
-    // Create a detailed terrain analysis using LiDAR data
-    private func analyzePuttingGreen() -> (slopeMap: [[SIMD2<Float>]], heightProfile: [Float])? {
-        // 既存の実装ほぼそのまま
-        guard let frame = arView.session.currentFrame,
-              let sceneDepth = frame.sceneDepth else {
-            return nil
-        }
-        
-        let depthMap = sceneDepth.depthMap
-        let sampleSpacing: Float = 0.03
-        let gridSize = 15
-        
-        guard let ballPos = ballPosition, let holePos = holePosition else { return nil }
-        
-        var heightMap: [[Float]] = Array(repeating: Array(repeating: 0.0, count: gridSize), count: gridSize)
-        var slopeMap: [[SIMD2<Float>]] = Array(repeating: Array(repeating: SIMD2<Float>(0, 0), count: gridSize), count: gridSize)
-        
-        for x in 0..<gridSize {
-            for z in 0..<gridSize {
-                let offsetX = Float(x - gridSize/2) * sampleSpacing
-                let offsetZ = Float(z - gridSize/2) * sampleSpacing
-                
-                let worldPosition = SIMD3<Float>(
-                    ballPos.x + offsetX,
-                    ballPos.y,
-                    ballPos.z + offsetZ
-                )
-                
-                if let height = getHeightAt(worldPosition) {
-                    heightMap[z][x] = height
-                }
-            }
-        }
-        
-        for x in 1..<(gridSize-1) {
-            for z in 1..<(gridSize-1) {
-                let dx = (heightMap[z][x+1] - heightMap[z][x-1]) / (2 * sampleSpacing)
-                let dz = (heightMap[z+1][x] - heightMap[z-1][x]) / (2 * sampleSpacing)
-                
-                slopeMap[z][x] = SIMD2<Float>(dx, dz)
-            }
-        }
-        
-        // 追加: ボールからホールまでの高さプロファイル
-        var heightProfile: [Float] = []
-        let pathSamples = 20
+        // Sample densely along direct path
+        let pathSamples = max(30, Int(distance / 0.03)) // One sample every 3cm
+        print("Sampling \(pathSamples) points along direct path")
         
         for i in 0...pathSamples {
             let t = Float(i) / Float(pathSamples)
-            let pos = simd_mix(ballPos, holePos, SIMD3<Float>(t, t, t))
-            
-            if let height = getHeightAt(pos) {
-                heightProfile.append(height)
-            } else {
-                heightProfile.append(0.0)
-            }
-        }
-        
-        return (slopeMap: slopeMap, heightProfile: heightProfile)
-    }
-    
-    
-    private func sampleHeightAt(position: SIMD3<Float>) -> ARRaycastResult? {
-        // Create a proper ARRaycastQuery instead of using arView.raycast directly
-        let raycastQuery = ARRaycastQuery(
-            origin: position + SIMD3<Float>(0, 0.1, 0),
-            direction: SIMD3<Float>(0, -1, 0),
-            allowing: .estimatedPlane,
-            alignment: .any
-        )
-        
-        // Use the session to perform the raycast
-        let results = arView.session.raycast(raycastQuery)
-        
-        return results.first
-    }
-    
-    
-    // Visualize the slope map with a colored mesh overlay
-    private func visualizeSlopeMap(heightMap: [[Float]], slopeMap: [[SIMD2<Float>]], origin: SIMD3<Float>, spacing: Float) {
-        // Create visualization...
-        // This would generate a color-coded mesh overlay showing the slope
-    }
-    
-    private func getHeightAt(_ position: SIMD3<Float>) -> Float? {
-        guard let frame = arView.session.currentFrame,
-              let sceneDepth = frame.sceneDepth else {
-            print("DEBUG: No scene depth available")
-            return position.y
-        }
-        
-        // Log input position
-        print("DEBUG: Getting height for position: \(position)")
-        
-        // Project the 3D position to screen coordinates
-        let camera = frame.camera
-        let viewportSize = arView.bounds.size
-        let projectedPoint = camera.projectPoint(position, orientation: .portrait, viewportSize: viewportSize)
-        print("DEBUG: Projected to screen point: \(projectedPoint)")
-        
-        // Check if the point is within the viewport
-        if projectedPoint.x < 0 || projectedPoint.x >= viewportSize.width ||
-            projectedPoint.y < 0 || projectedPoint.y >= viewportSize.height {
-            print("DEBUG: Point is outside viewport")
-            return position.y
-        }
-        
-        // Convert to depth map coordinates
-        let depthMap = sceneDepth.depthMap
-        let depthWidth = CVPixelBufferGetWidth(depthMap)
-        let depthHeight = CVPixelBufferGetHeight(depthMap)
-        
-        let depthX = Int((projectedPoint.x / viewportSize.width) * CGFloat(depthWidth))
-        let depthY = Int((projectedPoint.y / viewportSize.height) * CGFloat(depthHeight))
-        print("DEBUG: Depth map coordinates: (\(depthX), \(depthY))")
-        
-        // Check depth bounds
-        guard depthX >= 0, depthX < depthWidth, depthY >= 0, depthY < depthHeight else {
-            print("DEBUG: Depth coordinates out of bounds")
-            return position.y
-        }
-        
-        // Access the depth value directly
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-        
-        guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
-            print("DEBUG: Failed to get base address")
-            return position.y
-        }
-        
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-        let depthBufferAddress = baseAddress + depthY * bytesPerRow
-        let depthValue = depthBufferAddress.assumingMemoryBound(to: Float32.self)[depthX]
-        print("DEBUG: Raw depth value: \(depthValue)")
-        
-        // Filter invalid depth values
-        if depthValue.isNaN || depthValue <= 0 {
-            print("DEBUG: Invalid depth value")
-            return position.y
-        }
-        
-        // Use the ray through the point to get the world position
-        guard let rayResult = arView.ray(through: projectedPoint) else {
-            print("DEBUG: Failed to get ray through point")
-            return position.y
-        }
-        
-        // Calculate the world position using the depth value
-        let worldPosition = rayResult.origin + rayResult.direction * depthValue
-        print("DEBUG: Calculated world position: \(worldPosition)")
-        print("DEBUG: Height from ground: \(worldPosition.y)")
-        
-        return worldPosition.y
-    }
-    
-    private func unprojectScreenPoint(_ screenPoint: CGPoint, depth: Float, frame: ARFrame) -> SIMD3<Float>? {
-        let viewportSize = CGSize(width: frame.camera.imageResolution.width, height: frame.camera.imageResolution.height)
-        
-        // Create a plane at the given depth, perpendicular to the camera's view direction
-        let cameraTransform = frame.camera.transform
-        let cameraForward = SIMD3<Float>(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
-        
-        // Create a plane transformation matrix
-        var planeTransform = matrix_identity_float4x4
-        planeTransform.columns.3 = SIMD4<Float>(cameraTransform.columns.3.x + cameraForward.x * depth,
-                                                cameraTransform.columns.3.y + cameraForward.y * depth,
-                                                cameraTransform.columns.3.z + cameraForward.z * depth,
-                                                1.0)
-        
-        // Use the available unprojectPoint method
-        return frame.camera.unprojectPoint(
-            screenPoint,
-            ontoPlane: planeTransform,
-            orientation: .portrait,
-            viewportSize: viewportSize
-        )
-    }
-    
-    private func getDepthValue(at point: CGPoint, depthMap: CVPixelBuffer) -> Float? {
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-        
-        let width = CVPixelBufferGetWidth(depthMap)
-        let height = CVPixelBufferGetHeight(depthMap)
-        
-        // Ensure point is within bounds
-        let x = min(max(0, Int(point.x)), width - 1)
-        let y = min(max(0, Int(point.y)), height - 1)
-        
-        // Get pointer to depth data
-        let baseAddress = CVPixelBufferGetBaseAddress(depthMap)!
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-        let depthValue = baseAddress.load(fromByteOffset: y * bytesPerRow + x * MemoryLayout<Float>.size, as: Float.self)
-        
-        return depthValue > 0 && !depthValue.isNaN ? depthValue : nil
-    }
-    // Generate path points considering slope
-    private func generatePathPoints(from start: SIMD3<Float>, to end: SIMD3<Float>, slopeInfo: (angle: Float, direction: Float)) -> [SIMD3<Float>] {
-        let pointCount = 20
-        var points: [SIMD3<Float>] = []
-        
-        // Direct vector from start to end
-        let directVector = end - start
-        
-        // Calculate curve based on slope
-        let slopeAngleRad = slopeInfo.angle * .pi / 180
-        let slopeDirectionRad = slopeInfo.direction * .pi / 180
-        
-        // Simple curve offset based on slope
-        let curveStrength = abs(slopeAngleRad) * 0.5 // Adjust curve based on slope angle
-        
-        // Generate points along path with curve
-        for i in 0...pointCount {
-            let t = Float(i) / Float(pointCount)
-            
-            // Start with linear interpolation
-            var position = start + directVector * t
-            
-            // Add curve based on slope
-            if abs(slopeAngleRad) > 0.01 { // Only add curve if slope is significant
-                let curveOffset = sin(t * .pi) * curveStrength
-                
-                // Direction perpendicular to slope direction
-                let perpVector = SIMD3<Float>(
-                    cos(slopeDirectionRad + .pi/2),
-                    0,
-                    sin(slopeDirectionRad + .pi/2)
-                )
-                
-                position += perpVector * curveOffset
-            }
-            
-            points.append(position)
-        }
-        
-        return points
-    }
-    
-    // Create visual representation of the path
-    private func createPathVisualization(points: [SIMD3<Float>]) {
-        // Create a custom mesh for the path
-        var vertices: [SIMD3<Float>] = []
-        var triangleIndices: [UInt32] = []
-        
-        let lineWidth: Float = 0.01 // Width of the path
-        let upVector = SIMD3<Float>(0, 1, 0) // Up direction
-        
-        // Create a ribbon-like mesh along the path
-        for i in 0..<points.count-1 {
-            let p1 = points[i]
-            let p2 = points[i+1]
-            
-            // Direction vector
-            let dir = normalize(p2 - p1)
-            
-            // Perpendicular vector for width
-            let side = normalize(cross(dir, upVector)) * lineWidth
-            
-            // Create quad vertices (slightly above surface)
-            let v1 = p1 + side + SIMD3<Float>(0, 0.001, 0)
-            let v2 = p1 - side + SIMD3<Float>(0, 0.001, 0)
-            let v3 = p2 + side + SIMD3<Float>(0, 0.001, 0)
-            let v4 = p2 - side + SIMD3<Float>(0, 0.001, 0)
-            
-            // Add vertices
-            let baseIndex = UInt32(vertices.count)
-            vertices.append(contentsOf: [v1, v2, v3, v4])
-            
-            // Add triangle indices
-            triangleIndices.append(contentsOf: [
-                baseIndex, baseIndex + 1, baseIndex + 2,
-                baseIndex + 1, baseIndex + 3, baseIndex + 2
-            ])
-        }
-        
-        // Create mesh descriptor
-        var meshDescriptor = MeshDescriptor(name: "pathMesh")
-        meshDescriptor.positions = MeshBuffers.Positions(vertices)
-        meshDescriptor.primitives = .triangles(triangleIndices)
-        
-        // Create mesh resource
-        let pathMesh = try! MeshResource.generate(from: [meshDescriptor])
-        
-        // Create path entity with red material
-        let pathMaterial = SimpleMaterial(color: .red, isMetallic: false)
-        pathEntity = ModelEntity(mesh: pathMesh, materials: [pathMaterial])
-        
-        // Add to scene
-        let pathAnchor = AnchorEntity(world: .zero)
-        pathAnchor.addChild(pathEntity!)
-        arView.scene.addAnchor(pathAnchor)
-    }
-    
-    // Display slope information
-    private func displaySlopeInfo(_ slopeInfo: (angle: Float, direction: Float), heightDiff: Float) {
-        let directionText = getDirectionText(degrees: slopeInfo.direction)
-        
-        let slopeDescription: String
-        if slopeInfo.angle < 0.7 {
-            slopeDescription = heightDiff < 0 ? "微妙な下り" : "微妙な上り"
-        } else {
-            slopeDescription = heightDiff < 0 ? "下り" : "上り"
-        }
-        
-        infoLabel.text = "\(slopeDescription) (\(abs(heightDiff * 100))cm)、方向: \(directionText)"
-    }
-    
-    
-    // Convert degrees to direction text
-    private func getDirectionText(degrees: Float) -> String {
-        let normalized = (degrees + 360).truncatingRemainder(dividingBy: 360)
-        let directions = ["北", "北東", "東", "南東", "南", "南西", "西", "北西"]
-        let index = Int(round(normalized / 45.0)) % 8
-        return directions[index]
-    }
-    
-    // Add to ViewController.swift
-    private func getPuttingDataForAdvice() -> String {
-        guard let ballPos = ballPosition, let holePos = holePosition else {
-            return "データがありません"
-        }
-        
-        // First check if basic slope analysis indicates a flat surface
-        let basicSlopeInfo = analyzeSlopeBetween(ballPos, holePos)
-        let distance = length(holePos - ballPos) * 100 // Convert to cm
-        
-        // If basic slope analysis already indicates flat surface, return simplified data
-        if basicSlopeInfo.angle == 0.0 && basicSlopeInfo.lateralSlope == 0.0 {
-            return """
-            ライン詳細:
-            全長: \(String(format:"%.2f", distance))cm
-            傾斜: ほぼ平坦 (0°)
-            左右傾斜: なし (0°)
-            推奨: ホールの中心を狙い、通常の強さで打つ
-            """
-        }
-        
-        // Get detailed analysis with our improved slope filtering
-        let detailedAnalysis = analyzeDetailedLine(ballPos: ballPos, holePos: holePos, segments: 20)
-        
-        // Now check if the filtered detailed analysis still has any significant slopes
-        var hasSignificantSlope = false
-        for segment in detailedAnalysis {
-            if abs(segment.slopeAngle) > 0.5 || abs(segment.lateralSlope) > 0.5 {
-                hasSignificantSlope = true
-                break
-            }
-        }
-        
-        // If no significant slopes after filtering, return flat surface data
-        if !hasSignificantSlope {
-            return """
-            ライン詳細:
-            全長: \(String(format:"%.2f", distance))cm
-            傾斜: ほぼ平坦 (0°)
-            左右傾斜: なし (0°)
-            推奨: ホールの中心を狙い、通常の強さで打つ
-            """
-        }
-        
-        // For actual sloped surfaces, use the existing format
-        var accumulatedDistance: Float = 0.0
-        var analysisText = "ライン詳細（各セグメント）:\n"
-        
-        for segment in detailedAnalysis {
-            accumulatedDistance += segment.distance * 100 // cmに変換
-            analysisText += """
-            \(segment.index+1). 距離:\(String(format:"%.2f",accumulatedDistance))cm \
-            高低差:\(String(format:"%.1f",segment.heightDiff*100))cm \
-            傾斜角度:\(String(format:"%.1f",segment.slopeAngle))° \
-            左右傾斜:\(String(format:"%.1f",segment.lateralSlope))°\n
-            """
-        }
-        
-        print("LOG: Collected detailed putting data: \(analysisText)")
-        return analysisText
-    }
-    // ラインをセグメントに分割し、各セグメントの詳細傾斜を算出する
-    // Update analyzeDetailedLine to filter unrealistic slopes
-    private func analyzeDetailedLine(ballPos: SIMD3<Float>, holePos: SIMD3<Float>, segments: Int)
-    -> [(index: Int, distance: Float, heightDiff: Float, slopeAngle: Float, lateralSlope: Float)] {
-        
-        var results = [(index: Int, distance: Float, heightDiff: Float, slopeAngle: Float, lateralSlope: Float)]()
-        let segmentLength = 1.0 / Float(segments)
-        
-        // Get initial height
-        guard let ballHeight = getHeightAt(ballPos) else {
-            return []
-        }
-        
-        // Calculate total distance in meters
-        let totalDistance = simd_distance(
-            SIMD3<Float>(ballPos.x, 0, ballPos.z),
-            SIMD3<Float>(holePos.x, 0, holePos.z)
-        )
-        
-        print("DEBUG: Total distance: \(totalDistance)")
-        
-        // Calculate segment distance
-        let segmentDistance = totalDistance / Float(segments)
-        var accumulatedDistance: Float = 0.0
-        
-        for i in 0..<segments {
-            let tStart = Float(i) * segmentLength
-            let tEnd = Float(i+1) * segmentLength
-            
-            let startPos = simd_mix(ballPos, holePos, SIMD3<Float>(tStart, tStart, tStart))
-            let endPos = simd_mix(ballPos, holePos, SIMD3<Float>(tEnd, tEnd, tEnd))
-            
-            guard let startHeight = getHeightAt(startPos), let endHeight = getHeightAt(endPos) else {
-                continue
-            }
-            
-            // Calculate height difference in meters
-            // Divide by 100 to get realistic values
-            let segmentHeightDiff = (-(endHeight - startHeight)) / 100.0
-            
-            // Calculate slope angle with the scaled height difference
-            let segmentSlopeAngle = atan2(segmentHeightDiff, segmentDistance) * (180 / .pi)
-            
-            // Calculate lateral slope with same scaling
-            let directionAngle = atan2(endPos.x - startPos.x, endPos.z - startPos.z)
-            let perpendicularVector = SIMD3<Float>(
-                cos(directionAngle + .pi/2),
-                0,
-                sin(directionAngle + .pi/2)
+            let pathPoint = SIMD3<Float>(
+                ball.x + (hole.x - ball.x) * t,
+                (ball.y + hole.y) / 2,
+                ball.z + (hole.z - ball.z) * t
             )
             
-            let lateralSampleDistance: Float = 0.05
-            var segmentLateralSlope: Float = 0.0
-            
-            if let leftHeight = getHeightAt(startPos - perpendicularVector * lateralSampleDistance),
-               let rightHeight = getHeightAt(startPos + perpendicularVector * lateralSampleDistance) {
-                // Apply the same scaling factor to lateral slope
-                segmentLateralSlope = -atan2((rightHeight - leftHeight) / 100.0, lateralSampleDistance * 2) * (180 / .pi)
+            // Sample each point multiple times
+            for _ in 0..<3 {
+                collectTerrainSample(at: pathPoint)
             }
-            
-            // Update accumulated distance
-            accumulatedDistance += segmentDistance
-            
-            // Add to results
-            results.append((
-                index: i,
-                distance: accumulatedDistance / 100, // Convert to cm
-                heightDiff: segmentHeightDiff / 100, // Convert to cm
-                slopeAngle: segmentSlopeAngle,       // Now properly scaled
-                lateralSlope: segmentLateralSlope    // Now properly scaled
-            ))
         }
         
-        return results
+        // Now sample the wider grid
+        let halfWidth = width / 2.0
+        let rows = max(5, Int(ceil(distance / resolution)))
+        let cols = Int(ceil(width / resolution))
+        
+        var totalLocations = rows * cols
+        var sampledLocations = 0
+        
+        // Start the grid sampling timer
+        terrainSamplingTimer = Timer.scheduledTimer(withTimeInterval: 0.01, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            
+            if sampledLocations < totalLocations {
+                // Calculate row and column for current sample
+                let row = sampledLocations / cols
+                let col = sampledLocations % cols
+                
+                // Calculate t position along path (0 to 1)
+                let t = Float(row) / Float(rows - 1)
+                
+                // Calculate center position along path
+                let centerPos = SIMD3<Float>(
+                    ball.x + (hole.x - ball.x) * t,
+                    (ball.y + hole.y) / 2,
+                    ball.z + (hole.z - ball.z) * t
+                )
+                
+                // Calculate offset from center
+                let offset = (Float(col) - Float(cols)/2.0) * resolution
+                
+                // Calculate final sample position
+                let samplePos = SIMD3<Float>(
+                    centerPos.x + sideVector.x * offset,
+                    centerPos.y,
+                    centerPos.z + sideVector.z * offset
+                )
+                
+                // Take sample
+                collectTerrainSample(at: samplePos)
+                
+                sampledLocations += 1
+                self.collectionProgress = Float(sampledLocations) / Float(totalLocations)
+                
+                // Update UI
+                DispatchQueue.main.async {
+                    self.infoTextView.text  = "Collecting terrain data (\(Int(self.collectionProgress * 100))%)..."
+                }
+            } else {
+                // Final verification pass
+                // Sample exactly at ball and hole positions one more time
+                for _ in 0..<5 {
+                    self.collectTerrainSample(at: ball)
+                    self.collectTerrainSample(at: hole)
+                }
+                
+                // Finished collecting
+                self.stopTerrainDataCollection()
+            }
+        }
     }
-} //  end of class
+    
+    
+    // Add this method to process and stop collection
+    private func stopTerrainDataCollection() {
+        terrainSamplingTimer?.invalidate()
+        terrainSamplingTimer = nil
+        isCollectingTerrainData = false
+        
+        // Process the samples
+        processTerrainData()
+        // Debug coverage
+        debugTerrainCoverage()
+     
+        
+        // Now run simulation
+        DispatchQueue.main.async {
+            self.infoTextView.text  = "Analyzing terrain and calculating shot..."
+            self.analyzeAndRender()
+        }
+        // ボールとホールの位置にサンプルがあるか確認
+        // In stopTerrainDataCollection()
+        if let ball = ballPosition, let hole = holePosition {
+            // Use the SAME rounding as in collectTerrainSample
+            let resolution: Float = 0.20 // Must match resolution used in collectTerrainSample
+            
+            // Get the grid-aligned keys
+            let ballBucketPos = SIMD3<Float>(
+                round(ball.x / resolution) * resolution,
+                0,
+                round(ball.z / resolution) * resolution
+            )
+            
+            let holeBucketPos = SIMD3<Float>(
+                round(hole.x / resolution) * resolution,
+                0,
+                round(hole.z / resolution) * resolution
+            )
+            
+            // Debug print the actual keys we're checking against
+            print("Checking for ball at key: \(ballBucketPos)")
+            print("Checking for hole at key: \(holeBucketPos)")
+            
+            if terrainSampleBuffer[ballBucketPos] == nil {
+                print("WARNING: No samples at ball position!")
+            }
+            
+            if terrainSampleBuffer[holeBucketPos] == nil {
+                print("WARNING: No samples at hole position!")
+            }
+            
+            // Report sample counts
+            print("Collected \(terrainSampleBuffer.count) unique terrain positions with \(terrainSampleBuffer.values.flatMap { $0 }.count) total samples")
+        }
+    }
 
-//
-// Add ARSessionDelegate conformance and implement frame processing
-//
-extension ViewController: ARSessionDelegate {
+    // Add this method to process data
+    private func processTerrainData() {
+        // 近くの位置のサンプルと比較して、突然の高さの変化のみを外れ値とする
+        // 緩やかな傾斜（上り坂/下り坂）は保持する
+        var processedData = [SIMD3<Float>: Float]()
+        
+        // すべての高さを収集
+        var allHeights: [Float] = []
+        for (_, heights) in terrainSampleBuffer {
+            if heights.count > 0 {
+                let sortedHeights = heights.sorted()
+                let median = sortedHeights[heights.count / 2]
+                allHeights.append(median)
+            }
+        }
+        
+        // データがなければ終了
+        if allHeights.isEmpty {
+            print("No terrain data collected!")
+            return
+        }
+        
+        // 全体の中央値と分布を計算
+        allHeights.sort()
+        let globalMedian = allHeights[allHeights.count / 2]
+        
+        // 標準偏差を計算
+        var sum: Float = 0
+        for height in allHeights {
+            sum += height
+        }
+        let mean = sum / Float(allHeights.count)
+        
+        var sumSquaredDiff: Float = 0
+        for height in allHeights {
+            let diff = height - mean
+            sumSquaredDiff += diff * diff
+        }
+        let stdDev = sqrt(sumSquaredDiff / Float(allHeights.count))
+        
+        print("Terrain heights: count=\(allHeights.count), median=\(globalMedian), mean=\(mean), stdDev=\(stdDev)")
+        
+        // 外れ値閾値を大幅に上げる（自然な傾斜を保持するため）
+        let maxDeviation = max(stdDev * 5.0, 0.15) // 標準偏差の5倍または15cm以上を外れ値とする
+        var outlierCount = 0
+        
+        for (position, heights) in terrainSampleBuffer {
+            if heights.count > 0 {
+                let sortedHeights = heights.sorted()
+                let localMedian = sortedHeights[heights.count / 2]
+                
+                // 近くの位置のサンプルを探す
+                var nearbyHeights: [Float] = []
+                let searchRadius: Float = 0.1 // 10cm以内
+                
+                for (otherPos, otherHeights) in terrainSampleBuffer {
+                    let dx = position.x - otherPos.x
+                    let dz = position.z - otherPos.z
+                    let dist = sqrt(dx*dx + dz*dz)
+                    
+                    if dist < searchRadius && dist > 0.001 {
+                        if let median = otherHeights.sorted().dropFirst(otherHeights.count / 2).first {
+                            nearbyHeights.append(median)
+                        }
+                    }
+                }
+                
+                if !nearbyHeights.isEmpty {
+                    // 近くのサンプルの高さの範囲を計算
+                    nearbyHeights.sort()
+                    let minNearby = nearbyHeights.first!
+                    let maxNearby = nearbyHeights.last!
+                    let rangeNearby = maxNearby - minNearby
+                    
+                    // 近くのサンプルの範囲内か、わずかに外れる程度なら調整しない
+                    let tolerance: Float = 0.05 // 5cm
+                    if localMedian >= minNearby - tolerance && localMedian <= maxNearby + tolerance {
+                        // 自然な傾斜と判断して調整しない
+                        processedData[position] = localMedian
+                    } else if abs(localMedian - globalMedian) > maxDeviation {
+                        // 本当に外れ値の場合のみ調整
+                        let adjustedPosition = SIMD3<Float>(position.x, globalMedian, position.z)
+                        processedData[adjustedPosition] = globalMedian
+                        print("True outlier adjusted: pos=\(position), height=\(localMedian) -> \(globalMedian)")
+                        outlierCount += 1
+                    } else {
+                        // それ以外は調整しない
+                        processedData[position] = localMedian
+                    }
+                } else {
+                    // 比較対象がない場合は全体との比較のみ
+                    if abs(localMedian - globalMedian) > maxDeviation {
+                        let adjustedPosition = SIMD3<Float>(position.x, globalMedian, position.z)
+                        processedData[adjustedPosition] = globalMedian
+                        print("Isolated outlier adjusted: pos=\(position), height=\(localMedian) -> \(globalMedian)")
+                        outlierCount += 1
+                    } else {
+                        processedData[position] = localMedian
+                    }
+                }
+            }
+        }
+        
+        print("Processed \(processedData.count) terrain locations, adjusted \(outlierCount) outliers")
+        
+        // 処理したデータで更新
+        terrainSampleBuffer.removeAll()
+        for (position, height) in processedData {
+            terrainSampleBuffer[position] = [height]
+        }
+    }
+    // MARK: - Analysis & Rendering
+    private func analyzeAndRender() {
+        guard let ball = ballPosition, let hole = holePosition else { return }
+        var minAngle: Float = Float.greatestFiniteMagnitude
+        var maxAngle: Float = -Float.greatestFiniteMagnitude
+        
+        // Clear existing path visualization
+        for anchor in pathAnchors {
+            arView.scene.removeAnchor(anchor)
+        }
+        pathAnchors.removeAll()
+        
+        // Create mesh and plan shots
+        let mesh = createHighQualityMesh(from: ball, to: hole)
+        
+        // Use multiShotPlanner to plan shots
+        let shots = multiShotPlanner.planShots(from: ball, to: hole, simulator: simulator, pathFinder: pathFinder, mesh: mesh, maxShots: 50)
+        
+        // Calculate min/max angles for summary
+        for shot in shots {
+            minAngle = min(minAngle, shot.angle)
+            maxAngle = max(maxAngle, shot.angle)
+        }
+        
+        // Set default values if needed
+        if shots.isEmpty {
+            minAngle = 0
+            maxAngle = 0
+        }
+        
+        // Get the anchors for the best shot
+        pathAnchors = multiShotPlanner.getBestShotAnchors()
+        
+        // Add ONLY these anchors to the scene
+        for anchor in pathAnchors {
+            arView.scene.addAnchor(anchor)
+        }
+        
+        // Calculate direct distance in cm
+        let directDistance = sqrt(pow(hole.x - ball.x, 2) + pow(hole.z - ball.z, 2)) * 100
+        
+        // Get full path
+        let fullPath = shots.flatMap { $0.path }
+        
+        // Calculate height difference
+        let netHeightDiff = (hole.y - ball.y) * 100 // convert to cm
+        
+        // Calculate accumulated height changes
+        var accumulatedHeightChange: Float = 0
+        if fullPath.count > 1 {
+            var prevY = fullPath[0].y
+            for point in fullPath.dropFirst() {
+                accumulatedHeightChange += abs(point.y - prevY) * 100 // Convert to cm
+                prevY = point.y
+            }
+        }
+        
+        // Calculate power adjustment based on height difference
+        let basePower: Float = 1.0
+        let powerAdjustment: Float
+        
+        if netHeightDiff > 0 {
+            // Uphill: increase power based on steepness
+            powerAdjustment = 1.0 + (netHeightDiff / 100.0)  // Add 1% power per cm of elevation
+        } else {
+            // Downhill: decrease power based on steepness
+            powerAdjustment = 1.0 - (abs(netHeightDiff) / 200.0)  // Reduce 0.5% power per cm of descent
+        }
+        
+        // Ensure power stays within reasonable range
+        let recommendedPower = max(0.5, min(1.5, basePower * powerAdjustment))
+        
+        // Build debug information for display
+        var debugLines = [String]()
+        debugLines.append("🧪 デバッグ情報:")
+        
+        // Calculate closest approach for each shot
+        for (i, shot) in shots.enumerated() {
+            var closestDistance: Float = Float.greatestFiniteMagnitude
+            var closestIndex: Int = 0
+            
+            for (j, point) in shot.path.enumerated() {
+                let dist = length(SIMD3<Float>(
+                    point.x - hole.x,
+                    0,
+                    point.z - hole.z
+                ))
+                
+                if dist < closestDistance {
+                    closestDistance = dist
+                    closestIndex = j
+                }
+            }
+            
+            debugLines.append("ショット #\(i+1):")
+            debugLines.append("  角度: \(String(format: "%.2f", shot.angle))°")
+  //          debugLines.append("  パワー: \(String(format: "%.2f", shot.speed))")
+            debugLines.append("  最接近: \(String(format: "%.2f", closestDistance * 100))cm (ステップ \(closestIndex))")
+        }
+        
+        // Add terrain slope info
+        if let ballMeshPoint = getNearestMeshPoint(position: ball, mesh: mesh) {
+            debugLines.append("地形情報 (出発点):")
+            debugLines.append("  前方傾斜: \(String(format: "%.2f", ballMeshPoint.slope))°")
+            debugLines.append("  横方向傾斜: \(String(format: "%.2f", ballMeshPoint.lateral))°")
+        }
+        
+        // Display shot instructions - Modified to handle multiple shots clearly
+        var lines = [String]()
+        
+        // Add simulation summary at the top
+        lines.append("📊 シミュレーション概要:")
+        lines.append("- 試行回数: \(shots.count)回")
+        lines.append("- 角度範囲: \(String(format: "%.2f", minAngle))° ~ \(String(format: "%.2f", maxAngle))°")
+        
+        // Add result information
+        if let best = shots.last, best.successful {
+            lines.append("- 成功! 角度 \(String(format: "%.2f", best.angle))°で入りました")
+        } else if let best = shots.last {
+            let lastPoint = best.path.last ?? SIMD3<Float>(0,0,0)
+            let holeDistance = length(SIMD3<Float>(
+                lastPoint.x - hole.x,
+                0,
+                lastPoint.z - hole.z
+            ))
+            lines.append("- 惜しい! 角度 \(String(format: "%.2f", best.angle))°で \(String(format: "%.2f", holeDistance * 100))cm届きませんでした")
+        }
+        lines.append("") // Empty line for spacing
+        
+        // Only use the last shot for the main instruction (most recent shot)
+        if let lastShot = shots.last {
+            // Direction message with exact angle
+            let directionMsg: String
+            let angleStr = String(format: "%.1f", abs(lastShot.angle))
+            
+            if abs(lastShot.angle) < 0.1 { // Stricter threshold for "straight"
+                directionMsg = "まっすぐ狙う (\(angleStr)°)"
+            } else if lastShot.angle > 0 {
+                directionMsg = "\(angleStr)度右に狙う"
+            } else {
+                directionMsg = "\(angleStr)度左に狙う"
+            }
+            
+            lines.append(directionMsg)
+            lines.append("距離: \(Int(directDistance))cm")
+            
+            // Add power recommendation based on height
+  //          let powerStr = String(format: "%.2f", recommendedPower)
+  //          lines.append("推奨パワー: \(powerStr)")
+            
+            if accumulatedHeightChange > 1.5 {
+                lines.append("累積高低差: \(Int(accumulatedHeightChange))cm - 強めに打つ")
+            }
+            else if abs(netHeightDiff) > 1.0 {
+                if netHeightDiff > 0 {
+                    lines.append("上り傾斜 (+\(Int(netHeightDiff))cm) - 強めに打つ")
+                } else {
+                    lines.append("下り傾斜 (\(Int(netHeightDiff))cm) - 弱めに打つ")
+                }
+            }
+            
+            // Add information about previous shots if there were multiple
+            if shots.count > 1 {
+                lines.append("")
+                lines.append("これまでの \(shots.count - 1) ショット:")
+                
+                for i in 0..<shots.count-1 {
+                    let prevShot = shots[i]
+                    let prevAngleStr = String(format: "%.1f", abs(prevShot.angle))
+                    
+                    // Calculate closest approach for this shot
+                    var closestDistance: Float = Float.greatestFiniteMagnitude
+                    for point in prevShot.path {
+                        let dist = length(SIMD3<Float>(
+                            point.x - hole.x,
+                            0,
+                            point.z - hole.z
+                        ))
+                        if dist < closestDistance {
+                            closestDistance = dist
+                        }
+                    }
+                    
+                    let prevDirectionMsg: String
+                    if abs(prevShot.angle) < 0.1 {
+                        prevDirectionMsg = "まっすぐ (\(prevAngleStr)°)"
+                    } else if prevShot.angle > 0 {
+                        prevDirectionMsg = "\(prevAngleStr)° 右"
+                    } else {
+                        prevDirectionMsg = "\(prevAngleStr)° 左"
+                    }
+                    
+                    lines.append("ショット #\(i+1): \(prevDirectionMsg), 最接近: \(String(format: "%.1f", closestDistance * 100))cm")
+                }
+            }
+        }
+        
+       
+        // Combine instructions and debug info
+        let showDebugInfo = true // Set to true/false to control debug info visibility
+        if showDebugInfo {
+            infoTextView.text = (lines + [""] + debugLines).joined(separator: "\n")
+        } else {
+            infoTextView.text = lines.joined(separator: "\n")
+        }
+    }
+    
+    // Helper method to get the nearest mesh point
+    private func getNearestMeshPoint(position: SIMD3<Float>, mesh: SurfaceMesh) -> MeshPoint? {
+        var nearestPoint: MeshPoint?
+        var minDistance = Float.greatestFiniteMagnitude
+        
+        for row in mesh.grid {
+            for point in row {
+                let dx = position.x - point.position.x
+                let dz = position.z - point.position.z
+                let dist = sqrt(dx*dx + dz*dz)
+                
+                if dist < minDistance {
+                    minDistance = dist
+                    nearestPoint = point
+                }
+            }
+        }
+        
+        return nearestPoint
+    }
+    
+    // MARK: - Reset
+    @objc private func resetTapped() {
+        // Clear all anchors
+        if let ball = ballAnchor {
+            arView.scene.removeAnchor(ball)
+            ballAnchor = nil
+        }
+        
+        if let hole = holeAnchor {
+            arView.scene.removeAnchor(hole)
+            holeAnchor = nil
+        }
+        
+        terrainSampleBuffer.removeAll()
+        
+        for anchor in pathAnchors {
+            arView.scene.removeAnchor(anchor)
+        }
+        pathAnchors.removeAll()
+        
+        // Make sure to also clear terrain visualization
+        if let terrain = terrainVisualizationAnchor {
+            arView.scene.removeAnchor(terrain)
+            terrainVisualizationAnchor = nil
+        }
+        
+        // Reset UI state
+        showingTerrain = false
+        terrainButton.setTitle("Show Terrain", for: .normal)
+        ballPosition = nil
+        holePosition = nil
+        currentMode = .none
+        setHoleButton.isEnabled = false
+        infoTextView.text  = "Tap 'Set Ball' to begin"
+    }
+    
+    // MARK: - ARSessionDelegate
+    // MARK: - ARSessionDelegate
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // Process frame for object detection
-        processCurrentFrame()
     }
-}
+    
+    // Add this method to setup the terrain visualization button
+    private func setupTerrainButton() {
+        terrainButton = UIButton(type: .system)
+        terrainButton.translatesAutoresizingMaskIntoConstraints = false
+        terrainButton.setTitle("Show Terrain", for: .normal)
+        terrainButton.backgroundColor = .systemTeal
+        terrainButton.setTitleColor(.white, for: .normal)
+        terrainButton.layer.cornerRadius = 8
+        terrainButton.addTarget(self, action: #selector(toggleTerrainVisualization), for: .touchUpInside)
+        view.addSubview(terrainButton)
+        
+        // Adjust terrain button position
+        NSLayoutConstraint.activate([
+            terrainButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 0),
+            terrainButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            terrainButton.widthAnchor.constraint(equalToConstant: 120),
+            terrainButton.heightAnchor.constraint(equalToConstant: 44)
+        ])
+    }
 
+    // Add this method to toggle the terrain visualization
+    // Fix for the optional String concatenation issue
 
-// Helper extension for SIMD4 to get xyz components
-extension SIMD4 {
-    var xyz: SIMD3<Scalar> {
-        return SIMD3<Scalar>(x, y, z)
+    // Only fix the toggleTerrainVisualization method to remove references to minY and maxY
+
+    @objc private func toggleTerrainVisualization() {
+        if showingTerrain {
+            // Properly remove ALL visualization elements
+            if let anchor = terrainVisualizationAnchor {
+                arView.scene.removeAnchor(anchor)
+                // Ensure the anchor is set to nil
+                terrainVisualizationAnchor = nil
+            }
+            terrainButton.setTitle("Show Terrain", for: .normal)
+        } else {
+            // Before creating new visualization, ensure old one is completely removed
+            if let anchor = terrainVisualizationAnchor {
+                arView.scene.removeAnchor(anchor)
+                terrainVisualizationAnchor = nil
+            }
+            
+            // Now create new visualization
+            if let ball = ballPosition, let hole = holePosition {
+                // Create a fresh mesh with the collected terrain samples
+                let mesh = createHighQualityMesh(from: ball, to: hole)
+                
+                // Create the terrain visualization
+                let terrainAnchor = mesh.createTerrainVisualization(in: arView)
+                
+                // Fix the anchor firmly in world space to prevent movement with camera
+                terrainAnchor.anchoring = AnchoringComponent(.world(transform: .init(diagonal: [1, 1, 1, 1])))
+                
+                // Add to scene and store reference
+                arView.scene.addAnchor(terrainAnchor)
+                terrainVisualizationAnchor = terrainAnchor
+                
+                // Debug output to verify anchor position
+                print("Terrain visualization anchored at world transform: \(terrainAnchor.transform)")
+                print("Visualization has \(terrainAnchor.children.count) child entities")
+                print("Using \(terrainSampleBuffer.count) collected terrain samples")
+            }
+            terrainButton.setTitle("Hide Terrain", for: .normal)
+        }
+        showingTerrain = !showingTerrain
     }
-}
-extension CGRect {
-    var mid: CGPoint {
-        return CGPoint(x: midX, y: midY)
+
+    // Helper to create a mesh using the collected terrain samples
+    private func createHighQualityMesh(from ballPos: SIMD3<Float>, to holePos: SIMD3<Float>) -> SurfaceMesh {
+        // ViewController.swift の createHighQualityMesh メソッド内
+        print("Creating mesh with ball at \(ballPos) and hole at \(holePos)")
+        
+        // Create the mesh with terrain samples
+        return SurfaceMesh(
+            ballPos: ballPos,
+            holePos: holePos,
+            resolution: 0.2,
+            meshWidth: 1.0,   // 1 meter width coverage
+            input: input,
+            terrainSamples: terrainSampleBuffer
+        )
     }
+    
+    
+    // Helper method to get elevation at a position
+    private func getElevationAt(position: SIMD3<Float>, mesh: SurfaceMesh) -> Float {
+        // Find the nearest mesh point and return its Y value
+        var nearestPoint = mesh.grid[0][0]
+        var minDistance = Float.greatestFiniteMagnitude
+        
+        for row in mesh.grid {
+            for point in row {
+                let dx = position.x - point.position.x
+                let dz = position.z - point.position.z
+                let dist = sqrt(dx*dx + dz*dz)
+                
+                if dist < minDistance {
+                    minDistance = dist
+                    nearestPoint = point
+                }
+            }
+        }
+        
+        return nearestPoint.position.y
+    }
+
 }
