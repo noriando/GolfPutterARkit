@@ -989,3 +989,277 @@ extension MeshResource {
     
     
 }
+
+// Add these to the SurfaceMesh class to enhance terrain handling
+
+extension SurfaceMesh {
+    // Enhanced initialization method that validates and improves terrain data
+    convenience init(ballPos: SIMD3<Float>, holePos: SIMD3<Float>, terrainManager: TerrainManager, resolution: Float = 0.2, meshWidth: Float = 1.5, input: ARInputProvider) {
+        // Get the processed terrain data from TerrainManager
+        let terrainSamples = terrainManager.getTerrainSamples()
+        
+        // Initialize with terrain samples
+        self.init(ballPos: ballPos, holePos: holePos, resolution: resolution, meshWidth: meshWidth, input: input, terrainSamples: terrainSamples)
+        
+        // Additional validation and enhancement of the mesh grid
+        validateAndEnhanceMeshGrid(terrainManager: terrainManager)
+    }
+    
+    // Validate and enhance the mesh grid with additional processing
+    private func validateAndEnhanceMeshGrid(terrainManager: TerrainManager) {
+        guard !grid.isEmpty else { return }
+        
+        // Verify ball and hole positions have accurate heights
+        let ballRow = 0
+        let ballCol = grid[0].count / 2
+        let holeRow = grid.count - 1
+        let holeCol = grid[0].count / 2
+        
+        // Ensure ball and hole heights are exactly correct
+        grid[ballRow][ballCol].position.y = ball.y
+        grid[holeRow][holeCol].position.y = hole.y
+        
+        print("Validating mesh - Ball height: \(ball.y), Grid ball height: \(grid[ballRow][ballCol].position.y)")
+        print("Validating mesh - Hole height: \(hole.y), Grid hole height: \(grid[holeRow][holeCol].position.y)")
+        
+        // Smooth the terrain to eliminate any abrupt changes
+        smoothTerrain()
+        
+        // Recalculate normals and slopes
+        recalculateNormalsAndSlopes()
+    }
+    
+    // Smooth the terrain to eliminate artifacts and ensure natural slopes
+    private func smoothTerrain() {
+        let rows = grid.count
+        let cols = grid[0].count
+        
+        // Create a copy of the original grid to use as reference
+        var originalGrid = [[Float]](repeating: [Float](repeating: 0, count: cols), count: rows)
+        for i in 0..<rows {
+            for j in 0..<cols {
+                originalGrid[i][j] = grid[i][j].position.y
+            }
+        }
+        
+        // Apply Gaussian-like smoothing (except at ball and hole positions)
+        for i in 0..<rows {
+            for j in 0..<cols {
+                // Skip ball and hole positions
+                if (i == 0 && j == cols/2) || (i == rows-1 && j == cols/2) {
+                    continue
+                }
+                
+                var sum: Float = 0
+                var weight: Float = 0
+                
+                // Look at 5x5 neighborhood
+                for ni in max(0, i-2)...min(rows-1, i+2) {
+                    for nj in max(0, j-2)...min(cols-1, j+2) {
+                        // Skip ball and hole positions in the neighborhood
+                        if (ni == 0 && nj == cols/2) || (ni == rows-1 && nj == cols/2) {
+                            continue
+                        }
+                        
+                        // Calculate distance-based weight
+                        let dist = sqrt(Float((ni-i)*(ni-i) + (nj-j)*(nj-j)))
+                        let w = 1.0 / (1.0 + dist)
+                        
+                        sum += originalGrid[ni][nj] * w
+                        weight += w
+                    }
+                }
+                
+                if weight > 0 {
+                    let smoothedHeight = sum / weight
+                    
+                    // Apply limited smoothing to avoid over-flattening
+                    let currentHeight = originalGrid[i][j]
+                    let blendFactor: Float = 0.5 // 50% blend between original and smoothed
+                    let finalHeight = currentHeight * (1 - blendFactor) + smoothedHeight * blendFactor
+                    
+                    // Update grid with smoothed height
+                    grid[i][j].position.y = finalHeight
+                }
+            }
+        }
+        
+        print("Terrain smoothing applied")
+    }
+    
+    // Recalculate normals and slopes after terrain modification
+    private func recalculateNormalsAndSlopes() {
+        let rows = grid.count
+        let cols = grid[0].count
+        
+        if rows == 0 || cols == 0 { return }
+        
+        // Calculate path vector
+        let dx = hole.x - ball.x
+        let dz = hole.z - ball.z
+        
+        // Direction vectors
+        let forwardDir = normalize(SIMD3<Float>(dx, 0, dz))
+        let lateralDir = normalize(SIMD3<Float>(-dz, 0, dx))
+        
+        // Recalculate normals and slopes for all grid points
+        for i in 0..<rows {
+            for j in 0..<cols {
+                var point = grid[i][j]
+                
+                // Calculate new normal
+                point.normal = calculateSurfaceNormalFromGrid(row: i, col: j)
+                
+                // Calculate slopes based on the normal
+                let (slopeAngle, lateralAngle) = calculateSlopes(
+                    normal: point.normal,
+                    forwardDir: forwardDir,
+                    lateralDir: lateralDir,
+                    row: i,
+                    col: j
+                )
+                
+                point.slope = slopeAngle
+                point.lateral = lateralAngle
+                
+                grid[i][j] = point
+            }
+        }
+        
+        print("Normals and slopes recalculated")
+    }
+    
+    // Enhanced terrain height lookup
+    func getTerrainHeight(at horizontalPosition: SIMD3<Float>) -> Float {
+        // Find the closest grid points
+        var closestRow = 0
+        var closestCol = 0
+        var minDistance = Float.greatestFiniteMagnitude
+        
+        for i in 0..<grid.count {
+            for j in 0..<grid[i].count {
+                let gridPos = grid[i][j].position
+                let dx = horizontalPosition.x - gridPos.x
+                let dz = horizontalPosition.z - gridPos.z
+                let dist = sqrt(dx*dx + dz*dz)
+                
+                if dist < minDistance {
+                    minDistance = dist
+                    closestRow = i
+                    closestCol = j
+                }
+            }
+        }
+        
+        // If the point is very close to a grid point, use that height directly
+        if minDistance < resolution * 0.1 {
+            return grid[closestRow][closestCol].position.y
+        }
+        
+        // Otherwise, use bilinear interpolation for smoother height
+        // Find the grid cell containing the query position
+        var topLeft: SIMD3<Float>?
+        var topRight: SIMD3<Float>?
+        var bottomLeft: SIMD3<Float>?
+        var bottomRight: SIMD3<Float>?
+        var topLeftIdx: (Int, Int)?
+        var topRightIdx: (Int, Int)?
+        var bottomLeftIdx: (Int, Int)?
+        var bottomRightIdx: (Int, Int)?
+        
+        // Find the surrounding grid cell
+        for i in 0..<(grid.count-1) {
+            for j in 0..<(grid[i].count-1) {
+                let p00 = grid[i][j].position
+                let p01 = grid[i][j+1].position
+                let p10 = grid[i+1][j].position
+                let p11 = grid[i+1][j+1].position
+                
+                // Check if the point is inside this grid cell
+                if isPointInQuad(point: horizontalPosition,
+                                quad: [p00, p01, p11, p10]) {
+                    topLeft = p00
+                    topRight = p01
+                    bottomLeft = p10
+                    bottomRight = p11
+                    topLeftIdx = (i, j)
+                    topRightIdx = (i, j+1)
+                    bottomLeftIdx = (i+1, j)
+                    bottomRightIdx = (i+1, j+1)
+                    break
+                }
+            }
+            if topLeft != nil { break }
+        }
+        
+        // If we found a containing cell, interpolate
+        if let tl = topLeft, let tr = topRight,
+           let bl = bottomLeft, let br = bottomRight,
+           let tlIdx = topLeftIdx, let trIdx = topRightIdx,
+           let blIdx = bottomLeftIdx, let brIdx = bottomRightIdx {
+            
+            // Calculate normalized coordinates within the cell
+            let width = distance(tl, tr)
+            let height = distance(tl, bl)
+            
+            let dx1 = horizontalPosition.x - tl.x
+            let dz1 = horizontalPosition.z - tl.z
+            
+            // Project onto cell axes
+            let forwardDir = normalize(SIMD3<Float>(bl.x - tl.x, 0, bl.z - tl.z))
+            let rightDir = normalize(SIMD3<Float>(tr.x - tl.x, 0, tr.z - tl.z))
+            
+            // Calculate normalized coordinates (0-1)
+            let t = dot(SIMD3<Float>(dx1, 0, dz1), forwardDir) / height
+            let s = dot(SIMD3<Float>(dx1, 0, dz1), rightDir) / width
+            
+            // Clamp to ensure we stay in bounds
+            let u = max(0, min(1, s))
+            let v = max(0, min(1, t))
+            
+            // Bilinear interpolation
+            let topHeight = grid[tlIdx.0][tlIdx.1].position.y * (1 - u) +
+                            grid[trIdx.0][trIdx.1].position.y * u
+            let bottomHeight = grid[blIdx.0][blIdx.1].position.y * (1 - u) +
+                              grid[brIdx.0][brIdx.1].position.y * u
+            
+            let interpolatedHeight = topHeight * (1 - v) + bottomHeight * v
+            return interpolatedHeight
+        }
+        
+        // Fallback to nearest point
+        return grid[closestRow][closestCol].position.y
+    }
+    
+    // Helper method to check if a point is inside a quadrilateral (in XZ plane)
+    private func isPointInQuad(point: SIMD3<Float>, quad: [SIMD3<Float>]) -> Bool {
+        // Ignore Y coordinate, work in XZ plane
+        let p = SIMD2<Float>(point.x, point.z)
+        let q0 = SIMD2<Float>(quad[0].x, quad[0].z)
+        let q1 = SIMD2<Float>(quad[1].x, quad[1].z)
+        let q2 = SIMD2<Float>(quad[2].x, quad[2].z)
+        let q3 = SIMD2<Float>(quad[3].x, quad[3].z)
+        
+        // Check if the point is inside the quadrilateral using the
+        // same-side test for each edge
+        let edges = [(q0, q1), (q1, q2), (q2, q3), (q3, q0)]
+        
+        for (start, end) in edges {
+            // Edge vector
+            let edge = end - start
+            
+            // Vector from start to point
+            let toPoint = p - start
+            
+            // Cross product to determine which side of the edge the point is on
+            let cross = edge.x * toPoint.y - edge.y * toPoint.x
+            
+            // If point is on the wrong side of any edge, it's outside
+            if cross < 0 {
+                return false
+            }
+        }
+        
+        return true
+    }
+}
