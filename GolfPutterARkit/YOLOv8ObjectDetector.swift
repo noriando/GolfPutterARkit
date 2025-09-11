@@ -7,6 +7,10 @@
 import Foundation
 import Vision
 import UIKit
+import os         // Added for Logger
+
+// Logger instance for YOLOv8ObjectDetector
+private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "YOLOv8ObjectDetector")
 
 // Define COCO labels array
 let cocoClasses = [
@@ -57,21 +61,21 @@ class YOLOv8ObjectDetector {
     }()
     
     init() {
-        print("YOLOv8ONNXDetector initialized")
+        logger.info("YOLOv8ONNXDetector initialized")
         setupModel()
     }
     
     private func setupModel() {
         // Look for both ONNX and CoreML models
-        if let modelPath = Bundle.main.path(forResource: "train14_best", ofType: "mlmodelc") {
+        if let modelPath = Bundle.main.path(forResource: "train15_best", ofType: "mlmodelc") {
             do {
                 // If converted model exists
                 let modelURL = URL(fileURLWithPath: modelPath)
                 let coreMLModel = try MLModel(contentsOf: modelURL)
                 visionModel = try VNCoreMLModel(for: coreMLModel)
-                print("Loaded CoreML model from: \(modelPath)")
+                logger.info("Loaded CoreML model from: \(modelPath, privacy: .public)")
             } catch {
-                print("Error loading CoreML model: \(error)")
+                logger.error("Error loading CoreML model: \(error, privacy: .public)")
             }
         } else if let modelPath = Bundle.main.path(forResource: "yolov8s", ofType: "mlmodel") {
             do {
@@ -79,49 +83,49 @@ class YOLOv8ObjectDetector {
                 let modelURL = URL(fileURLWithPath: modelPath)
                 let coreMLModel = try MLModel(contentsOf: modelURL)
                 visionModel = try VNCoreMLModel(for: coreMLModel)
-                print("Loaded CoreML model (uncompiled) from: \(modelPath)")
+                logger.info("Loaded CoreML model (uncompiled) from: \(modelPath, privacy: .public)")
             } catch {
-                print("Error loading CoreML model: \(error)")
+                logger.error("Error loading CoreML model: \(error, privacy: .public)")
             }
         } else if let onnxPath = Bundle.main.path(forResource: "yolov8s", ofType: "onnx") {
             do {
                 // For ONNX models, we need to convert them to CoreML first
                 // Note: This should be done during app build process, not at runtime
                 // This is just a placeholder to indicate you need to convert ONNX to CoreML
-                print("Found ONNX model at: \(onnxPath)")
-                print("⚠️ ONNX models need to be converted to CoreML before use.")
-                print("⚠️ Use coremltools to convert the model before adding to the app.")
+                logger.info("Found ONNX model at: \(onnxPath, privacy: .public)")
+                logger.warning("⚠️ ONNX models need to be converted to CoreML before use.")
+                logger.warning("⚠️ Use coremltools to convert the model before adding to the app.")
             } catch {
-                print("Error with ONNX model: \(error)")
+                logger.error("Error with ONNX model: \(error, privacy: .public)")
             }
         } else {
-            print("⚠️ No model file found. Add yolov8s.mlmodel to your Xcode project.")
+            logger.warning("⚠️ No model file found. Add yolov8s.mlmodel to your Xcode project.")
         }
     }
     
     /// Runs inference on a UIImage and returns an array of DetectionBox.
     func detectObjects(in image: UIImage, completion: @escaping ([DetectionBox]) -> Void) {
         guard let cgImage = image.cgImage else {
-            print("Failed to get CGImage from UIImage.")
+            logger.error("Failed to get CGImage from UIImage.")
             completion([])
             return
         }
         
         guard let visionModel = visionModel else {
-            print("No Vision model available. Make sure to add yolov8s.mlmodel to your Xcode project.")
+            logger.error("No Vision model available. Make sure to add yolov8s.mlmodel to your Xcode project.")
             completion([])
             return
         }
         
         let imageSize = CGSize(width: cgImage.width, height: cgImage.height)
-        print("Processing image with size: \(imageSize.width) x \(imageSize.height)")
+        logger.debug("Processing image with size: \(imageSize.width, format: .fixed(precision: 0), privacy: .public) x \(imageSize.height, format: .fixed(precision: 0), privacy: .public)")
         
         // Create Vision request
         let request = VNCoreMLRequest(model: visionModel) { [weak self] request, error in
             guard let self = self else { return }
             
             if let error = error {
-                print("VNCoreMLRequest error: \(error)")
+                logger.error("VNCoreMLRequest error: \(error, privacy: .public)")
                 completion([])
                 return
             }
@@ -139,7 +143,7 @@ class YOLOv8ObjectDetector {
             do {
                 try handler.perform([request])
             } catch {
-                print("Failed to perform Vision request: \(error)")
+                logger.error("Failed to perform Vision request: \(error, privacy: .public)")
                 completion([])
             }
         }
@@ -151,10 +155,10 @@ class YOLOv8ObjectDetector {
         // Try both result types the Vision framework might return
         if let results = request.results as? [VNRecognizedObjectObservation] {
             // Standard Vision object detection results
-            print("Processing \(results.count) VNRecognizedObjectObservation results")
+            logger.debug("Processing \(results.count, privacy: .public) VNRecognizedObjectObservation results")
             
             for result in results {
-                print("Raw confidence: \(result.confidence)")
+                logger.debug("Raw confidence: \(result.confidence, format: .fixed(precision: 4), privacy: .public)")
                 
                 // Get the best label
                 guard let topLabel = result.labels.first else { continue }
@@ -164,9 +168,9 @@ class YOLOv8ObjectDetector {
                 let labelName = topLabel.identifier.lowercased()
                 
                 if labelName == "golf ball" || labelName == "sports ball" {
-                    requiredConfidence = 0.7 // 70% for golf balls
+                    requiredConfidence = 0.5 // 50% for golf balls
                 } else if labelName == "golf hole" {
-                    requiredConfidence = 0.5 // 50% for holes
+                    requiredConfidence = 0.3 // 30% for holes
                 } else {
                     requiredConfidence = confidenceThreshold // Default for other objects
                 }
@@ -187,10 +191,10 @@ class YOLOv8ObjectDetector {
             }
         } else if let results = request.results as? [VNDetectedObjectObservation] {
             // Some models might return this type instead
-            print("Processing \(results.count) VNDetectedObjectObservation results")
+            logger.debug("Processing \(results.count, privacy: .public) VNDetectedObjectObservation results")
             
             for result in results {
-                print("Raw confidence: \(result.confidence)")
+                logger.debug("Raw confidence: \(result.confidence, format: .fixed(precision: 4), privacy: .public)")
                 
                 // For VNDetectedObjectObservation, we don't have labels
                 // We'll need to use another method to identify the object class
@@ -214,8 +218,8 @@ class YOLOv8ObjectDetector {
                 let className = classIndex == 0 ? "golf ball" : "golf hole"
                 
                 // Adjust confidence threshold after classification
-                if className == "golf ball" && result.confidence < 0.7 { continue }
-                if className == "golf hole" && result.confidence < 0.5 { continue }
+                if className == "golf ball" && result.confidence < 0.5 { continue }
+                if className == "golf hole" && result.confidence < 0.3 { continue }
                 
                 let detection = DetectionBox(
                     className: className,
@@ -226,10 +230,10 @@ class YOLOv8ObjectDetector {
                 detections.append(detection)
             }
         } else {
-            print("Unknown result type from Vision framework")
+            logger.warning("Unknown result type from Vision framework")
         }
         
-        print("Returning \(detections.count) filtered detections")
+        logger.debug("Returning \(detections.count, privacy: .public) filtered detections")
         completion(detections)
     }
     
@@ -247,4 +251,3 @@ class YOLOv8ObjectDetector {
         return CGRect(x: absoluteX, y: absoluteY, width: absoluteWidth, height: absoluteHeight)
     }
 }
-

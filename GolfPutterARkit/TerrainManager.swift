@@ -7,19 +7,26 @@
 
 import RealityKit
 import ARKit
+import os
+import Foundation
 
-// Delegate protocol to inform ViewController of terrain scanning status
+private let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "TerrainManager")
+
 protocol TerrainManagerDelegate: AnyObject {
     func terrainScanningProgress(pass: Int, maxPasses: Int, progress: Float)
     func terrainScanningComplete()
     func terrainVisualizationUpdated(anchor: AnchorEntity?)
+    func terrainManagerDetectedUnstableTerrain(_ manager: TerrainManager, variance: Float, threshold: Float, completion: @escaping (Bool) -> Void)
 }
 
-/// Class to handle terrain data collection and management
 class TerrainManager {
-    // MARK: - Properties
     weak var delegate: TerrainManagerDelegate?
     private var arView: ARView
+    
+    // Golf-specific properties
+    private var ballPosition: SIMD3<Float>?
+    private var holePosition: SIMD3<Float>?
+    private var groundPlaneHeight: Float = 0.0
     
     // Scanning state
     private var isCollectingTerrainData = false
@@ -27,471 +34,387 @@ class TerrainManager {
     private var collectionProgress: Float = 0
     private var terrainScanPasses: Int = 0
     private var maxScanPasses: Int = 5
-    private var terrainVarianceThreshold: Float = 0.01 // 1cm
+    private var terrainVarianceThreshold: Float = 0.01
     
-    // Visualization
+    // Golf quality control
+    private let maxReasonableSlope: Float = 8.0
+    private let maxHeightVariation: Float = 0.3
+    private var validSampleCount: Int = 0
+    private var totalSampleAttempts: Int = 0
+    
+    // Resolution and visualization
+    private var scanningResolution: Float = 0.08
     private var scanAreaAnchor: AnchorEntity?
-    private var scanningResolution: Float = 0.05 // 5cm grid
     
     // Terrain data storage
     private(set) var terrainSampleBuffer: [SIMD3<Float>: [Float]] = [:]
     private(set) var normalizedTerrainData: [SIMD3<Float>: Float] = [:]
     private(set) var isTerrainDataReady: Bool = false
     
-    // MARK: - Initialization
     init(arView: ARView) {
         self.arView = arView
     }
     
-    // MARK: - Public Methods
-    
-    /// Begin terrain data collection
-    func startTerrainScanning() {
-        // Reset all terrain data and state
-        terrainSampleBuffer.removeAll()
-        normalizedTerrainData.removeAll()
-        terrainScanPasses = 0
-        isTerrainDataReady = false
+    func startGolfTerrainScanning(ballPos: SIMD3<Float>, holePos: SIMD3<Float>) {
+        self.ballPosition = ballPos
+        self.holePosition = holePos
+        self.groundPlaneHeight = (ballPos.y + holePos.y) / 2.0
         
-        // Start the first scan pass
-        startTerrainScanPass()
+        // Reset all data
+        self.terrainSampleBuffer.removeAll()
+        self.normalizedTerrainData.removeAll()
+        self.terrainScanPasses = 0
+        self.isTerrainDataReady = false
+        self.validSampleCount = 0
+        self.totalSampleAttempts = 0
+        
+        // Calculate golf-appropriate scan area
+        let shotDistance = self.distance(ballPos, holePos)
+        let scanWidth = min(8.0, max(2.0, shotDistance * 0.8))
+        let scanLength = shotDistance + 1.0
+        
+        logger.info("Golf terrain scan: distance=\(shotDistance)m, area=\(scanWidth)x\(scanLength)m")
+        self.startGolfScanPass(ballPos: ballPos, holePos: holePos, width: scanWidth, length: scanLength)
     }
     
-    /// Cancel any in-progress scanning
-    func cancelScanning() {
-        terrainSamplingTimer?.invalidate()
-        terrainSamplingTimer = nil
-        isCollectingTerrainData = false
+    func startTerrainScanning() {
+        logger.warning("Using generic terrain scanning - recommend using startGolfTerrainScanning instead")
+        let defaultBall = SIMD3<Float>(0, -0.77, 0)
+        let defaultHole = SIMD3<Float>(0, -0.77, -1.5)
+        self.startGolfTerrainScanning(ballPos: defaultBall, holePos: defaultHole)
+    }
+    
+    private func startGolfScanPass(ballPos: SIMD3<Float>, holePos: SIMD3<Float>, width: Float, length: Float) {
+        self.terrainScanPasses += 1
         
-        // Remove visualization
-        if let scanArea = scanAreaAnchor {
-            arView.scene.removeAnchor(scanArea)
-            scanAreaAnchor = nil
-            delegate?.terrainVisualizationUpdated(anchor: nil)
+        let shotDirection = normalize(SIMD3<Float>(holePos.x - ballPos.x, 0, holePos.z - ballPos.z))
+        let lateralDirection = normalize(SIMD3<Float>(-shotDirection.z, 0, shotDirection.x))
+        
+        var scanPositions: [SIMD3<Float>] = []
+        
+        let forwardSteps = Int(length / self.scanningResolution)
+        let lateralSteps = Int(width / self.scanningResolution)
+        
+        for i in 0...forwardSteps {
+            let forwardProgress = Float(i) / Float(forwardSteps)
+            let forwardPos = ballPos + shotDirection * (length * forwardProgress)
+            
+            for j in -(lateralSteps/2)...(lateralSteps/2) {
+                let lateralOffset = Float(j) * self.scanningResolution
+                let scanPos = forwardPos + lateralDirection * lateralOffset
+                scanPositions.append(SIMD3<Float>(scanPos.x, self.groundPlaneHeight, scanPos.z))
+            }
+        }
+        
+        logger.debug("Pass \(self.terrainScanPasses): \(scanPositions.count) positions")
+        self.samplePositionsWithQuality(positions: scanPositions)
+    }
+    
+    private func samplePositionsWithQuality(positions: [SIMD3<Float>]) {
+        var currentIndex = 0
+        self.isCollectingTerrainData = true
+        
+        self.terrainSamplingTimer = Timer.scheduledTimer(withTimeInterval: 0.01, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+            
+            let batchSize = 8
+            for _ in 0..<batchSize {
+                if currentIndex >= positions.count { break }
+                
+                self.collectValidatedSample(at: positions[currentIndex])
+                currentIndex += 1
+            }
+            
+            let progress = Float(currentIndex) / Float(positions.count)
+            DispatchQueue.main.async {
+                self.delegate?.terrainScanningProgress(
+                    pass: self.terrainScanPasses,
+                    maxPasses: self.maxScanPasses,
+                    progress: progress
+                )
+            }
+            
+            if currentIndex >= positions.count {
+                timer.invalidate()
+                self.evaluateAndContinueScanning()
+            }
         }
     }
     
-    /// Reset all terrain data
-    func reset() {
-        cancelScanning()
-        terrainSampleBuffer.removeAll()
-        normalizedTerrainData.removeAll()
-        isTerrainDataReady = false
-        terrainScanPasses = 0
-    }
-    
-    /// Get terrain height at a specific position
-    func getTerrainHeight(at position: SIMD3<Float>) -> Float {
-        // Default height if no data
-        let defaultHeight: Float = position.y
+    private func collectValidatedSample(at position: SIMD3<Float>) {
+        self.totalSampleAttempts += 1
         
-        // If terrain data isn't ready, return the original height
-        if !isTerrainDataReady { return defaultHeight }
+        guard let height = self.getValidatedSurfaceHeight(at: position) else { return }
         
-        // Find exact match in normalized data
+        let heightDiff = abs(height - self.groundPlaneHeight)
+        if heightDiff > self.maxHeightVariation {
+            return
+        }
+        
         let roundedPos = SIMD3<Float>(
-            round(position.x / scanningResolution) * scanningResolution,
+            round(position.x / self.scanningResolution) * self.scanningResolution,
             0,
-            round(position.z / scanningResolution) * scanningResolution
+            round(position.z / self.scanningResolution) * self.scanningResolution
         )
         
-        if let height = normalizedTerrainData[roundedPos] {
+        if self.terrainSampleBuffer[roundedPos] == nil {
+            self.terrainSampleBuffer[roundedPos] = []
+        }
+        
+        self.terrainSampleBuffer[roundedPos]?.append(height)
+        self.validSampleCount += 1
+    }
+    
+    private func getValidatedSurfaceHeight(at position: SIMD3<Float>) -> Float? {
+        if let lidarHeight = self.getLiDARHeight(at: position) {
+            return lidarHeight
+        }
+        
+        if let planeHeight = self.getARPlaneHeight(at: position) {
+            return planeHeight
+        }
+        
+        if let raycastHeight = self.getDirectRaycastHeight(at: position) {
+            return raycastHeight
+        }
+        
+        return nil
+    }
+    
+    private func getLiDARHeight(at position: SIMD3<Float>) -> Float? {
+        guard ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth),
+              let frame = self.arView.session.currentFrame,
+              let depthMap = frame.sceneDepth?.depthMap,
+              let screenPoint = self.arView.project(position) else { return nil }
+        
+        let depthWidth = CVPixelBufferGetWidth(depthMap)
+        let depthHeight = CVPixelBufferGetHeight(depthMap)
+        
+        let normalizedX = Float(screenPoint.x) / Float(self.arView.bounds.width)
+        let normalizedY = Float(screenPoint.y) / Float(self.arView.bounds.height)
+        let depthX = Int(normalizedX * Float(depthWidth))
+        let depthY = Int(normalizedY * Float(depthHeight))
+        
+        guard depthX >= 0 && depthX < depthWidth && depthY >= 0 && depthY < depthHeight else { return nil }
+        
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+        
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        let baseAddress = CVPixelBufferGetBaseAddress(depthMap)!
+        let depthValue = baseAddress.advanced(by: depthY * bytesPerRow + depthX * MemoryLayout<Float32>.size)
+            .assumingMemoryBound(to: Float32.self).pointee
+        
+        if depthValue > 0 && depthValue < 10.0 {
+            let results = self.arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .any)
+            return results.first?.worldTransform.columns.3.y
+        }
+        
+        return nil
+    }
+    
+    private func getARPlaneHeight(at position: SIMD3<Float>) -> Float? {
+        guard let frame = self.arView.session.currentFrame else { return nil }
+        
+        var closestHeight: Float?
+        var closestDistance: Float = Float.greatestFiniteMagnitude
+        
+        for anchor in frame.anchors {
+            guard let planeAnchor = anchor as? ARPlaneAnchor else { continue }
+            
+            let planeCenter = SIMD3<Float>(
+                planeAnchor.transform.columns.3.x,
+                planeAnchor.transform.columns.3.y,
+                planeAnchor.transform.columns.3.z
+            )
+            
+            let distance = simd_distance(SIMD2<Float>(position.x, position.z),
+                                       SIMD2<Float>(planeCenter.x, planeCenter.z))
+            
+            let maxExtent = max(planeAnchor.extent.x, planeAnchor.extent.z)
+            
+            if distance < maxExtent && distance < closestDistance {
+                closestDistance = distance
+                closestHeight = planeCenter.y
+            }
+        }
+        
+        return closestHeight
+    }
+    
+    private func getDirectRaycastHeight(at position: SIMD3<Float>) -> Float? {
+        let rayOrigin = SIMD3<Float>(position.x, position.y + 1.0, position.z)
+        let results = self.arView.scene.raycast(origin: rayOrigin, direction: SIMD3<Float>(0, -1, 0), length: 2.0, query: .nearest)
+        return results.first?.position.y
+    }
+    
+    private func evaluateAndContinueScanning() {
+        self.isCollectingTerrainData = false
+        
+        let successRate = self.totalSampleAttempts > 0 ? Float(self.validSampleCount) / Float(self.totalSampleAttempts) : 0.0
+        let dataVariance = self.calculateGolfTerrainVariance()
+        
+        logger.info("Pass \(self.terrainScanPasses): \(self.validSampleCount)/\(self.totalSampleAttempts) valid (\(Int(successRate*100))%), variance: \(dataVariance)")
+        
+        let hasMinimumSamples = self.validSampleCount >= 50
+        let hasLowVariance = dataVariance < self.terrainVarianceThreshold
+        let hasGoodSuccessRate = successRate > 0.6
+        
+        if self.terrainScanPasses >= self.maxScanPasses {
+            if !hasGoodSuccessRate {
+                logger.warning("Poor terrain quality: \(Int(successRate*100))% valid samples")
+            }
+            self.finalizeGolfTerrainData()
+        } else if hasMinimumSamples && hasLowVariance && hasGoodSuccessRate {
+            logger.info("Golf terrain quality acceptable")
+            self.finalizeGolfTerrainData()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self = self,
+                      let ballPos = self.ballPosition,
+                      let holePos = self.holePosition else { return }
+                
+                let shotDistance = self.distance(ballPos, holePos)
+                let scanWidth = min(8.0, max(2.0, shotDistance * 0.8))
+                let scanLength = shotDistance + 1.0
+                
+                self.startGolfScanPass(ballPos: ballPos, holePos: holePos, width: scanWidth, length: scanLength)
+            }
+        }
+    }
+    
+    private func calculateGolfTerrainVariance() -> Float {
+        if self.terrainScanPasses <= 1 {
+            return Float.greatestFiniteMagnitude
+        }
+        
+        guard self.validSampleCount > 10 else { return Float.greatestFiniteMagnitude }
+        
+        var allHeights: [Float] = []
+        for heights in self.terrainSampleBuffer.values {
+            allHeights.append(contentsOf: heights)
+        }
+        
+        guard !allHeights.isEmpty else { return Float.greatestFiniteMagnitude }
+        
+        let mean = allHeights.reduce(0, +) / Float(allHeights.count)
+        let variance = allHeights.reduce(0) { sum, height in
+            sum + (height - mean) * (height - mean)
+        } / Float(allHeights.count)
+        
+        return variance
+    }
+    
+    private func finalizeGolfTerrainData() {
+        self.normalizedTerrainData = self.normalizeGolfTerrainData()
+        self.isTerrainDataReady = true
+        
+        if let scanArea = self.scanAreaAnchor {
+            self.arView.scene.removeAnchor(scanArea)
+            self.scanAreaAnchor = nil
+        }
+        
+        self.delegate?.terrainScanningComplete()
+        logger.info("Golf terrain finalized: \(self.normalizedTerrainData.count) points")
+    }
+    
+    private func normalizeGolfTerrainData() -> [SIMD3<Float>: Float] {
+        var normalizedData: [SIMD3<Float>: Float] = [:]
+        
+        for (position, heights) in self.terrainSampleBuffer {
+            guard !heights.isEmpty else { continue }
+            
+            let sortedHeights = heights.sorted()
+            let medianHeight = sortedHeights[heights.count / 2]
+            
+            let heightDiff = abs(medianHeight - self.groundPlaneHeight)
+            if heightDiff <= self.maxHeightVariation {
+                normalizedData[position] = medianHeight
+            }
+        }
+        
+        return normalizedData
+    }
+    
+    func cancelScanning() {
+        self.terrainSamplingTimer?.invalidate()
+        self.terrainSamplingTimer = nil
+        self.isCollectingTerrainData = false
+        
+        if let scanArea = self.scanAreaAnchor {
+            self.arView.scene.removeAnchor(scanArea)
+            self.scanAreaAnchor = nil
+            self.delegate?.terrainVisualizationUpdated(anchor: nil)
+        }
+    }
+    
+    func reset() {
+        self.cancelScanning()
+        self.terrainSampleBuffer.removeAll()
+        self.normalizedTerrainData.removeAll()
+        self.isTerrainDataReady = false
+        self.terrainScanPasses = 0
+        self.validSampleCount = 0
+        self.totalSampleAttempts = 0
+    }
+    
+    func getTerrainHeight(at position: SIMD3<Float>) -> Float {
+        let defaultHeight: Float = position.y
+        
+        if !self.isTerrainDataReady { return defaultHeight }
+        
+        let roundedPos = SIMD3<Float>(
+            round(position.x / self.scanningResolution) * self.scanningResolution,
+            0,
+            round(position.z / self.scanningResolution) * self.scanningResolution
+        )
+        
+        if let height = self.normalizedTerrainData[roundedPos] {
             return height
         }
         
-        // No exact match, interpolate from nearby points
-        let searchRadius: Float = 0.15 // 15cm
+        let searchRadius: Float = 0.15
         var weightedHeights: [Float] = []
         var totalWeight: Float = 0
         
-        for (samplePos, height) in normalizedTerrainData {
+        for (samplePos, height) in self.normalizedTerrainData {
             let dx = position.x - samplePos.x
             let dz = position.z - samplePos.z
             let dist = sqrt(dx*dx + dz*dz)
             
             if dist < searchRadius {
-                // Inverse distance weighting
                 let weight = 1.0 / max(0.01, dist * dist)
                 weightedHeights.append(height * weight)
                 totalWeight += weight
             }
         }
         
-        // Calculate weighted average
         if !weightedHeights.isEmpty && totalWeight > 0 {
-            let interpolatedHeight = weightedHeights.reduce(0, +) / totalWeight
-            return interpolatedHeight
+            return weightedHeights.reduce(0, +) / totalWeight
         }
         
         return defaultHeight
     }
     
-    /// Provide terrain data for mesh generation
     func getTerrainSamples() -> [SIMD3<Float>: [Float]] {
-        // If we have normalized data, convert it back to the format SurfaceMesh expects
-        if isTerrainDataReady {
+        if self.isTerrainDataReady {
             var result: [SIMD3<Float>: [Float]] = [:]
-            for (pos, height) in normalizedTerrainData {
+            for (pos, height) in self.normalizedTerrainData {
                 result[pos] = [height]
             }
             return result
         }
-        
-        // Otherwise return the raw samples
-        return terrainSampleBuffer
+        return self.terrainSampleBuffer
     }
     
-    // MARK: - Private Methods - Scanning
-    
-    /// Start a single scan pass
-    private func startTerrainScanPass() {
-        // Increment pass counter
-        terrainScanPasses += 1
-        
-        // Get camera position and view
-        guard let cameraTransform = arView.session.currentFrame?.camera.transform else { return }
-        
-        // Camera position and forward direction
-        let cameraPosition = SIMD3<Float>(
-            cameraTransform.columns.3.x,
-            cameraTransform.columns.3.y,
-            cameraTransform.columns.3.z
-        )
-        
-        let forwardVector = normalize(SIMD3<Float>(
-            -cameraTransform.columns.2.x,
-            -cameraTransform.columns.2.y,
-            -cameraTransform.columns.2.z
-        ))
-        
-        // Define scan area dimensions
-        let scanDistance: Float = 2.0 // 1.5 meters ahead
-        let scanWidth: Float = 4.0     // 1.5 meters wide
-        let scanArea = generateScanAreaGrid(
-            center: cameraPosition + forwardVector * scanDistance,
-            width: scanWidth,
-            resolution: scanningResolution
-        )
-        
-        // Visualize scan area on first pass
-        if terrainScanPasses == 1 {
-            showScanAreaVisualization(center: scanArea.center, width: scanWidth)
-        }
-        
-        // Start collecting data
-        isCollectingTerrainData = true
-        collectionProgress = 0
-        
-        // Sample positions using timer
-        let totalSamples = scanArea.positions.count
-        var currentSample = 0
-        
-        terrainSamplingTimer = Timer.scheduledTimer(withTimeInterval: 0.005, repeats: true) { [weak self] timer in
-            guard let self = self else { timer.invalidate(); return }
-            
-            // Process multiple samples per frame
-            let batchSize = 10
-            for _ in 0..<batchSize {
-                if currentSample >= totalSamples {
-                    break
-                }
-                
-                // Get position to sample
-                let samplePos = scanArea.positions[currentSample]
-                
-                // Collect sample with pass number
-                self.collectTerrainSample(at: samplePos, pass: self.terrainScanPasses)
-                
-                currentSample += 1
-            }
-            
-            // Update progress
-            self.collectionProgress = Float(currentSample) / Float(totalSamples)
-            
-            // Update delegate
-            DispatchQueue.main.async {
-                self.delegate?.terrainScanningProgress(
-                    pass: self.terrainScanPasses,
-                    maxPasses: self.maxScanPasses,
-                    progress: self.collectionProgress
-                )
-                
-                // Update visualization
-                self.updateScanAreaColor(progress: self.collectionProgress)
-            }
-            
-            // Finished this pass
-            if currentSample >= totalSamples {
-                timer.invalidate()
-                self.completeScanPass()
-            }
-        }
+    func createTerrainVisualization(from ballPos: SIMD3<Float>, to holePos: SIMD3<Float>, mesh: SurfaceMesh, in arView: ARView) -> AnchorEntity {
+        return mesh.createTerrainVisualization(in: arView)
     }
     
-    /// Generate grid points for scanning
-    private func generateScanAreaGrid(center: SIMD3<Float>, width: Float, resolution: Float) -> (positions: [SIMD3<Float>], center: SIMD3<Float>) {
-        var positions: [SIMD3<Float>] = []
-        
-        // Calculate bounds
-        let halfWidth = width / 2
-        let minX = center.x - halfWidth
-        let maxX = center.x + halfWidth
-        let minZ = center.z - halfWidth
-        let maxZ = center.z + halfWidth
-        let y = center.y
-        
-        // Generate grid positions
-        let steps = Int(width / resolution)
-        for i in 0...steps {
-            for j in 0...steps {
-                let x = minX + Float(i) * resolution
-                let z = minZ + Float(j) * resolution
-                positions.append(SIMD3<Float>(x, y, z))
-            }
-        }
-        
-        return (positions, center)
-    }
-    
-    /// Collect a single terrain sample
-    private func collectTerrainSample(at position: SIMD3<Float>, pass: Int) {
-        if let height = getSurfaceHeightForSampling(at: position) {
-            // Round to grid
-            let roundedPos = SIMD3<Float>(
-                round(position.x / scanningResolution) * scanningResolution,
-                0,
-                round(position.z / scanningResolution) * scanningResolution
-            )
-            
-            // Store sample
-            if terrainSampleBuffer[roundedPos] == nil {
-                terrainSampleBuffer[roundedPos] = []
-            }
-            
-            terrainSampleBuffer[roundedPos]?.append(height)
-        }
-    }
-    
-    /// Complete a scan pass and check if more passes needed
-    private func completeScanPass() {
-        isCollectingTerrainData = false
-        
-        // Check if we need more passes
-        if terrainScanPasses < maxScanPasses {
-            // Check data variance
-            let dataVariance = calculateTerrainDataVariance()
-            print("Pass \(terrainScanPasses) complete. Data variance: \(dataVariance)")
-            
-            if dataVariance < terrainVarianceThreshold && terrainScanPasses >= 3 {
-                // Data has stabilized and we've done enough passes
-                print("Terrain data has stabilized after \(terrainScanPasses) passes")
-                finalizeTerrainData()
-            } else {
-                // Start next pass after a delay
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    guard let self = self else { return }
-                    self.startTerrainScanPass()
-                }
-            }
-        } else {
-            // Max passes reached, finalize
-            finalizeTerrainData()
-        }
-    }
-    
-    /// Calculate variance between passes
-    private func calculateTerrainDataVariance() -> Float {
-        // Only meaningful with multiple passes
-        if terrainScanPasses <= 1 {
-            return Float.greatestFiniteMagnitude
-        }
-        
-        var totalVariance: Float = 0
-        var sampleCount: Int = 0
-        
-        // Calculate variance across sample points
-        for (_, heights) in terrainSampleBuffer {
-            if heights.count >= 2 {
-                let avg = heights.reduce(0, +) / Float(heights.count)
-                let sumSquaredDiff = heights.reduce(0) { sum, height in
-                    sum + (height - avg) * (height - avg)
-                }
-                let variance = sumSquaredDiff / Float(heights.count)
-                
-                totalVariance += variance
-                sampleCount += 1
-            }
-        }
-        
-        // Return average variance
-        return sampleCount > 0 ? totalVariance / Float(sampleCount) : Float.greatestFiniteMagnitude
-    }
-    
-    /// Finalize terrain data after scanning
-    private func finalizeTerrainData() {
-        // Process data to get normalized heights
-        normalizedTerrainData = normalizeTerrainData()
-        isTerrainDataReady = true
-        
-        // Clean up
-        if let scanArea = scanAreaAnchor {
-            arView.scene.removeAnchor(scanArea)
-            scanAreaAnchor = nil
-            delegate?.terrainVisualizationUpdated(anchor: nil)
-        }
-        
-        // Notify delegate
-        DispatchQueue.main.async {
-            self.delegate?.terrainScanningComplete()
-        }
-        
-        print("Terrain data finalized with \(normalizedTerrainData.count) normalized points")
-    }
-    
-    /// Normalize terrain data by removing outliers
-    private func normalizeTerrainData() -> [SIMD3<Float>: Float] {
-        var normalizedData: [SIMD3<Float>: Float] = [:]
-        
-        for (position, heights) in terrainSampleBuffer {
-            if heights.isEmpty { continue }
-            
-            // Sort heights to prepare for outlier removal
-            let sortedHeights = heights.sorted()
-            
-            // Remove extreme outliers if we have enough samples
-            var trimmedHeights = sortedHeights
-            if heights.count >= 10 {
-                let trimCount = max(1, heights.count / 10) // 10% trim
-                trimmedHeights = Array(sortedHeights.dropFirst(trimCount).dropLast(trimCount))
-            }
-            
-            // Calculate median
-            let medianHeight = trimmedHeights[trimmedHeights.count / 2]
-            
-            // Store normalized value
-            normalizedData[position] = medianHeight
-        }
-        
-        return normalizedData
-    }
-    
-    // MARK: - Private Methods - Visualization
-    
-    /// Show visualization of scan area
-    private func showScanAreaVisualization(center: SIMD3<Float>, width: Float) {
-        // Remove existing visualization
-        if let existing = scanAreaAnchor {
-            arView.scene.removeAnchor(existing)
-        }
-        
-        // Create visualization mesh
-        let height: Float = 0.02 // 2cm thick
-        let scanAreaMesh = MeshResource.generateBox(size: [width, height, width])
-        let scanAreaMaterial = SimpleMaterial(color: .blue.withAlphaComponent(0.3), isMetallic: false)
-        let scanAreaEntity = ModelEntity(mesh: scanAreaMesh, materials: [scanAreaMaterial])
-        
-        // Create anchor and add to scene
-        let anchor = AnchorEntity(world: center)
-        anchor.addChild(scanAreaEntity)
-        arView.scene.addAnchor(anchor)
-        
-        // Store reference
-        scanAreaAnchor = anchor
-        delegate?.terrainVisualizationUpdated(anchor: anchor)
-    }
-    
-    /// Update visualization color based on progress
-    private func updateScanAreaColor(progress: Float) {
-        if let entity = scanAreaAnchor?.children.first as? ModelEntity {
-            // Blend from blue to green
-            let progressColor = UIColor(
-                red: CGFloat(0.0),
-                green: CGFloat(0.5 + 0.5 * progress),
-                blue: CGFloat(0.8 - 0.5 * progress),
-                alpha: 0.3
-            )
-            entity.model?.materials = [SimpleMaterial(color: progressColor, isMetallic: false)]
-        }
-    }
-    
-    // MARK: - Private Methods - Sampling
-    
-    /// Get surface height using ARKit
-    private func getSurfaceHeightForSampling(at position: SIMD3<Float>) -> Float? {
-        // First try LiDAR if available
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth),
-           let frame = arView.session.currentFrame,
-           let depthMap = frame.sceneDepth?.depthMap {
-            
-            // Project to screen
-            if let screenPoint = arView.project(position) {
-                // Get depth map dimensions
-                let depthWidth = CVPixelBufferGetWidth(depthMap)
-                let depthHeight = CVPixelBufferGetHeight(depthMap)
-                
-                // Convert to depth coordinates
-                let normalizedX = Float(screenPoint.x) / Float(arView.bounds.width)
-                let normalizedY = Float(screenPoint.y) / Float(arView.bounds.height)
-                let depthX = Int(normalizedX * Float(depthWidth))
-                let depthY = Int(normalizedY * Float(depthHeight))
-                
-                // Ensure valid coordinates
-                if depthX >= 0 && depthX < depthWidth && depthY >= 0 && depthY < depthHeight {
-                    // Access depth data
-                    CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-                    defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-                    
-                    // Get depth value
-                    let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-                    let baseAddress = CVPixelBufferGetBaseAddress(depthMap)!
-                    let depthValue = baseAddress.advanced(by: depthY * bytesPerRow + depthX * MemoryLayout<Float32>.size)
-                        .assumingMemoryBound(to: Float32.self).pointee
-                    
-                    if depthValue > 0 {
-                        // Use ARKit raycast with this screen point
-                        let results = arView.raycast(
-                            from: screenPoint,
-                            allowing: .estimatedPlane,
-                            alignment: .any
-                        )
-                        
-                        if let firstResult = results.first {
-                            return firstResult.worldTransform.columns.3.y
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Fallback to standard raycast
-        let rayOrigin = SIMD3<Float>(position.x, position.y + 0.5, position.z)
-        let rayDirection = SIMD3<Float>(0, -1, 0)
-        
-        // RealityKit raycast
-        let sceneResults = arView.scene.raycast(
-            origin: rayOrigin,
-            direction: rayDirection,
-            length: 1.0,
-            query: .nearest
-        )
-        
-        if let hit = sceneResults.first {
-            return hit.position.y
-        }
-        
-        // ARKit raycast
-        if let screenPoint = arView.project(rayOrigin) {
-            let results = arView.raycast(
-                from: screenPoint,
-                allowing: .estimatedPlane,
-                alignment: .any
-            )
-            
-            if let firstResult = results.first {
-                return firstResult.worldTransform.columns.3.y
-            }
-        }
-        
-        return position.y
+    private func distance(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Float {
+        return simd_distance(a, b)
     }
 }
